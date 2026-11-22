@@ -164,6 +164,102 @@ export function normalizeMetaPayload(body: Record<string, any>): NormalizedRecor
   return records;
 }
 
+/**
+ * Which shape a signed webhook body has: Meta's raw Cloud API payload (kind=meta, the
+ * recommended production setup), or Kapso's own event payload (the only kind Kapso
+ * sandbox numbers can send). Anything else is rejected by the route.
+ */
+export function webhookPayloadKind(body: unknown): "meta" | "kapso" | null {
+  if (!body || typeof body !== "object") return null;
+  const b = body as Record<string, any>;
+  if (Array.isArray(b.entry)) return "meta";
+  const isObject = (v: unknown) => Boolean(v) && typeof v === "object" && !Array.isArray(v);
+  if (isObject(b.message) || isObject(b.conversation) || Array.isArray(b.data) || b.batch === true) {
+    return "kapso";
+  }
+  return null;
+}
+
+/**
+ * Normalises a Kapso-format (v2) event into the same records the Meta parser produces, so the
+ * rest of the pipeline is identical. The event name arrives in the X-Webhook-Event header.
+ * Only incoming messages and delivery status events are used; conversation and other events
+ * return no records (the route still acknowledges them with 200).
+ */
+export function normalizeKapsoPayload(body: Record<string, any>, eventName = ""): NormalizedRecord[] {
+  const records: NormalizedRecord[] = [];
+  const items: Record<string, any>[] = Array.isArray(body?.data) ? body.data : [body];
+
+  for (const item of items) {
+    const msg = item?.message;
+    if (!msg || typeof msg !== "object") continue;
+
+    const direction = String(msg?.kapso?.direction || "").toLowerCase();
+    let event = String(eventName || "").trim().toLowerCase();
+    if (!event) {
+      event =
+        direction === "outbound"
+          ? `whatsapp.message.${String(msg?.kapso?.status || "sent").toLowerCase()}`
+          : "whatsapp.message.received";
+    }
+
+    const numberId = String(item?.phone_number_id || item?.conversation?.phone_number_id || "").trim();
+    const providerId = String(msg?.id || "").trim();
+    const ts = Number(msg?.timestamp) || nowSec();
+
+    if (event === "whatsapp.message.received") {
+      if (direction === "outbound") continue;
+      const contact = String(msg?.from || msg?.from_user_id || "").trim().replace(/^\+/, "");
+      const name = String(item?.conversation?.contact_name || "").trim() || contact || "Patient";
+      const msgType = String(msg?.type || "text");
+      let text = "";
+      let buttonPayload: string | null = null;
+      let isMedia = false;
+
+      if (msgType === "text") {
+        text = String(msg?.text?.body ?? msg?.kapso?.content ?? "").trim();
+      } else if (msgType === "button") {
+        text = String(msg?.button?.text || msg?.button?.payload || "").trim();
+        buttonPayload = msg?.button?.payload ? String(msg.button.payload) : null;
+      } else if (msgType === "interactive") {
+        const reply = msg?.interactive?.button_reply || msg?.interactive?.list_reply;
+        text = String(reply?.title || reply?.id || "").trim();
+        buttonPayload = reply?.id ? String(reply.id) : null;
+      } else {
+        isMedia = true;
+        text = `[Patient sent ${msgType} message — requires staff review]`;
+      }
+
+      records.push({
+        type: "inbound",
+        number_id: numberId,
+        provider_id: providerId,
+        contact,
+        name,
+        text,
+        received_at: ts,
+        button_payload: buttonPayload,
+        is_media: isMedia,
+        status: "received",
+      });
+    } else if (/^whatsapp\.message\.(sent|delivered|read|failed)$/.test(event)) {
+      records.push({
+        type: "status",
+        number_id: numberId,
+        provider_id: providerId,
+        contact: String(msg?.to || "").trim().replace(/^\+/, ""),
+        name: "",
+        text: "",
+        received_at: ts,
+        button_payload: null,
+        is_media: false,
+        status: event.split(".").pop() as string,
+      });
+    }
+  }
+  return records;
+}
+
 export interface SendResult {
   outcome: "accepted" | "retry" | "failed" | "uncertain";
   providerId?: string;
@@ -269,11 +365,23 @@ export async function sendReminderTemplate(
 export async function registerKapsoWebhook(
   numberId: string,
   webhookUrl: string,
+  kind: "meta" | "kapso" = "meta",
 ): Promise<{ ok: boolean; status: number; data: any }> {
   if (!KAPSO_API_KEY || !KAPSO_WEBHOOK_SECRET) {
     throw new Error("KAPSO_API_KEY and KAPSO_WEBHOOK_SECRET must be set");
   }
   const url = `${KAPSO_BASE_URL}/platform/v1/whatsapp/phone_numbers/${encodeURIComponent(numberId)}/webhooks`;
+  // kind=kapso is what Kapso sandbox numbers support; it needs an explicit event list.
+  const events =
+    kind === "kapso"
+      ? [
+          "whatsapp.message.received",
+          "whatsapp.message.sent",
+          "whatsapp.message.delivered",
+          "whatsapp.message.read",
+          "whatsapp.message.failed",
+        ]
+      : ["whatsapp.message.received", "whatsapp.message.status"];
   const res = await fetch(url, {
     method: "POST",
     headers: {
@@ -284,8 +392,8 @@ export async function registerKapsoWebhook(
       whatsapp_webhook: {
         url: webhookUrl,
         secret_key: KAPSO_WEBHOOK_SECRET,
-        kind: "meta",
-        events: ["whatsapp.message.received", "whatsapp.message.status"],
+        kind,
+        events,
       },
     }),
   });

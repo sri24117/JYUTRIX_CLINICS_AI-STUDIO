@@ -47,7 +47,7 @@ import {
 import { inbound, offerWaitlistForSlot, queueReply, takeover } from "./src/receptionist.js";
 import { computeReadiness, enableAutomation, setSignoff } from "./src/readiness.js";
 import { exportPerformanceCsv, performanceReport, resolvePeriod } from "./src/reports.js";
-import { normalizeMetaPayload, verifyKapsoSignature } from "./src/kapso.js";
+import { normalizeKapsoPayload, normalizeMetaPayload, verifyKapsoSignature, webhookPayloadKind } from "./src/kapso.js";
 import {
   CLERK_PUBLISHABLE_KEY,
   isClerkEnabled,
@@ -1608,7 +1608,7 @@ app.post(
   }),
 );
 
-// Kapso Meta-format WhatsApp webhook
+// Kapso WhatsApp webhook: Meta-format (kind=meta) or Kapso event format (what sandbox numbers send)
 app.post(
   "/webhooks/kapso/:clinicId",
   wrap(async (req, res) => {
@@ -1619,10 +1619,17 @@ app.post(
       throw new HttpError(401, "Invalid signature");
     }
     const body = req.body;
-    if (!body || typeof body !== "object" || !Array.isArray(body.entry)) {
-      throw new HttpError(422, "Configure a Kapso kind=meta webhook; expected Meta entry payload");
+    const kind = webhookPayloadKind(body);
+    if (!kind) {
+      throw new HttpError(
+        422,
+        "Unrecognised webhook payload: register a Kapso kind=meta webhook (recommended) or a Kapso event webhook",
+      );
     }
-    const records = normalizeMetaPayload(body);
+    const records =
+      kind === "meta"
+        ? normalizeMetaPayload(body)
+        : normalizeKapsoPayload(body, String(req.headers["x-webhook-event"] || ""));
     const rawIdem = String(req.headers["x-idempotency-key"] || "") || crypto.createHash("sha256").update(raw).digest("hex");
     const deliveryKey = crypto.createHash("sha256").update(`${clinicId}:${rawIdem}`).digest("hex");
 

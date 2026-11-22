@@ -12,6 +12,8 @@ jobs:
       - run: npm ci --ignore-scripts
       # Type check plus syntax checks for the frontend scripts.
       - run: npm run lint
+      # Webhook parsing plus the signed route end to end against a mock Kapso API.
+      - run: npm test
       - name: Start demo server
         run: |
           APP_MODE=demo PORT=8001 ADMIN_PASSWORD=ui-test-password-12345 npx tsx server.ts > server.log 2>&1 &

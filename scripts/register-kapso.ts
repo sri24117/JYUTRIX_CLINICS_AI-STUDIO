@@ -9,16 +9,21 @@ function arg(flag: string): string | undefined {
 
 const clinicId = arg("--clinic-id");
 const numberId = arg("--number-id");
+// meta (default): Meta-format payload, recommended for a real clinic number.
+// kapso: Kapso event payload, the only kind Kapso sandbox numbers support.
+const kind = (arg("--kind") || "meta").toLowerCase();
 
-if (!clinicId || !numberId) {
-  console.error("Usage: npx tsx scripts/register-kapso.ts --clinic-id <ID> --number-id <NUMBER_ID>");
+if (!clinicId || !numberId || (kind !== "meta" && kind !== "kapso")) {
+  console.error(
+    "Usage: npx tsx scripts/register-kapso.ts --clinic-id <ID> --number-id <NUMBER_ID> [--kind meta|kapso]",
+  );
   process.exit(1);
 }
 
 const webhookUrl = `${PUBLIC_URL}/webhooks/kapso/${clinicId}`;
-console.log(`Registering Kapso Meta webhook for clinic #${clinicId}: ${webhookUrl}`);
+console.log(`Registering Kapso ${kind} webhook for clinic #${clinicId}: ${webhookUrl}`);
 
-registerKapsoWebhook(numberId, webhookUrl)
+registerKapsoWebhook(numberId, webhookUrl, kind)
   .then((res) => {
     console.log(`Status: ${res.status}`, JSON.stringify(res.data, null, 2));
     if (!res.ok) process.exit(1);

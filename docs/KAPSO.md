@@ -10,12 +10,33 @@ Use a clinic-owned WhatsApp account. Keep KAPSO_API_KEY and KAPSO_WEBHOOK_SECRET
 From the deployment:
 
 ```bash
-docker compose exec app python -m scripts.register_kapso --clinic-id 1 --number-id YOUR_NUMBER_ID
+docker compose exec app npx tsx scripts/register-kapso.ts --clinic-id 1 --number-id YOUR_NUMBER_ID
 ```
 
-The helper uses Kapso's documented Platform endpoint and registers the chosen secret. Only one Meta webhook per number is supported; update an existing receiver through Kapso rather than creating duplicates. The receiver deliberately rejects the default Kapso v2 event payload: use **Meta-format**, not Kapso-format, for this release. This provides incoming messages and delivery status updates through one documented payload shape.
+The helper uses Kapso's documented Platform endpoint and registers the chosen secret. Only one Meta webhook per number is supported; update an existing receiver through Kapso rather than creating duplicates. **Meta-format (`--kind meta`, the default) is the recommended production setup**: one documented payload shape for incoming messages and delivery status. The receiver also accepts Kapso's own event format (`--kind kapso`), which is what Kapso sandbox numbers send; see "Sandbox testing" below. If you run under Coolify rather than Docker Compose, run the same `npx tsx scripts/register-kapso.ts ...` command from the app container's Terminal tab.
 
 Webhook verification uses the exact raw body and hex HMAC-SHA256 from `X-Webhook-Signature`; the clinic number inside the signed body must match its configured number ID. Both `X-Idempotency-Key` and provider message IDs are deduplicated in persistent storage.
+
+## Sandbox testing (Kapso-format webhooks)
+
+Kapso's sandbox lets a single test phone talk to a shared Kapso number without connecting a clinic number. Sandbox numbers support **Kapso event webhooks only**, so register with `--kind kapso`:
+
+```bash
+npx tsx scripts/register-kapso.ts --clinic-id 1 --number-id SANDBOX_PHONE_NUMBER_ID --kind kapso
+```
+
+Or add the endpoint in the Kapso dashboard (WhatsApp > Configurations > Sandbox WhatsApp > Manage Webhooks) using the URL `https://YOUR_DOMAIN/webhooks/kapso/CLINIC_ID` and the same secret as `KAPSO_WEBHOOK_SECRET`. Select at least: message received, sent, delivered, read and failed. Other events (for example conversation started) are acknowledged and ignored.
+
+The Kapso-format receiver:
+
+- verifies the same `X-Webhook-Signature` (hex HMAC-SHA256 of the exact raw body) and deduplicates on `X-Idempotency-Key`, exactly like the Meta-format receiver;
+- reads the event name from the `X-Webhook-Event` header; text, button and interactive replies are used, other media is routed to staff;
+- also accepts Kapso's batched envelope (`batch: true`, `data: [...]`) if "debounce into batches" is enabled, though leaving it off is simpler;
+- needs the sandbox's phone number ID saved in Clinic settings, as with a real number.
+
+Sandbox limits (from Kapso): text and interactive messages only, no templates, one registered tester number. Reminder messages cannot be tested in the sandbox. Use a real number with a Meta-format webhook before a pilot.
+
+`npm test` exercises both formats end to end against a mock Kapso API. No live Kapso account was used for these tests.
 
 ## Reminder template
 

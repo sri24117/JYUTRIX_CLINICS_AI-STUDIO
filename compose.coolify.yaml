@@ -1,0 +1,68 @@
+# Jyutrix for Coolify: same stack as compose.yaml, minus the Caddy proxy.
+# Coolify's own proxy (Traefik) already owns ports 80/443 on this server and issues
+# the HTTPS certificate. In Coolify, assign the domain to the `app` service on port 3000.
+#
+# Variables to set in Coolify (Environment Variables tab):
+#   POSTGRES_PASSWORD  random, URL-safe (hex)          required
+#   ADMIN_PASSWORD     random, 16+ characters           required
+#   PUBLIC_URL         defaults to https://jyutrix.cloud
+#   ADMIN_EMAIL, CLERK_*, KAPSO_*, OPENAI_*, VOICE_TOOL_KEY   optional, add later
+
+x-app-env: &app-env
+  APP_MODE: ${APP_MODE:-production}
+  PORT: "3000"
+  DATABASE_URL: postgresql://jyutrix:${POSTGRES_PASSWORD}@db:5432/jyutrix
+  ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+  ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+  PUBLIC_URL: ${PUBLIC_URL:-https://jyutrix.cloud}
+  CLERK_PUBLISHABLE_KEY: ${CLERK_PUBLISHABLE_KEY:-}
+  CLERK_SECRET_KEY: ${CLERK_SECRET_KEY:-}
+  KAPSO_API_KEY: ${KAPSO_API_KEY:-}
+  KAPSO_WEBHOOK_SECRET: ${KAPSO_WEBHOOK_SECRET:-}
+  KAPSO_API_VERSION: ${KAPSO_API_VERSION:-v24.0}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+  REMINDER_TEMPLATE: ${REMINDER_TEMPLATE:-jyutrix_appointment_reminder}
+  REMINDER_BUTTON_TEMPLATE: ${REMINDER_BUTTON_TEMPLATE:-jyutrix_appointment_reminder_buttons}
+  TEMPLATE_LANGUAGE: ${TEMPLATE_LANGUAGE:-en_US}
+  VOICE_TOOL_KEY: ${VOICE_TOOL_KEY:-}
+  RETENTION_DAYS: ${RETENTION_DAYS:-90}
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: jyutrix
+      POSTGRES_USER: jyutrix
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jyutrix -d jyutrix"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    environment: *app-env
+    depends_on:
+      db:
+        condition: service_healthy
+    expose: ["3000"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/health').then(r => { if (!r.ok) process.exit(1); }).catch(() => process.exit(1))",
+        ]
+      interval: 20s
+      timeout: 7s
+      retries: 5
+
+volumes:
+  postgres-data:

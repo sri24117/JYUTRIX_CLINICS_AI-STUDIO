@@ -8,7 +8,6 @@ function normalizeDatabaseUrl(raw: string): string {
 
 let pool: Pool | null = null;
 let initialized = false;
-let persistQueue: Promise<void> = Promise.resolve();
 
 export function isPostgresConfigured(): boolean {
   return Boolean(process.env.DATABASE_URL && process.env.DATABASE_URL.trim());
@@ -242,6 +241,15 @@ export async function initPersistence(): Promise<void> {
     return;
   }
 
+  if (pool) {
+    await pool.end().catch(() => {});
+    pool = null;
+  }
+  initialized = false;
+  snapshots = new Map();
+  flushing = null;
+  queued = null;
+
   const connectionString = normalizeDatabaseUrl(process.env.DATABASE_URL!);
   pool = new Pool({
     connectionString,
@@ -338,6 +346,14 @@ export async function initPersistence(): Promise<void> {
       db.recomputeSequences();
     }
 
+    // Remember what was just loaded so the next save writes only what changes after this point.
+    const loadedAt = nowSec();
+    rememberSnapshots(
+      SPECS.map((spec) => diffTable(spec, loadedAt)),
+      diffDeliveries().next,
+    );
+    await removeStaleRows(client, loadedAt, true);
+
     initialized = true;
     console.log(
       `[Jyutrix] Connected to PostgreSQL (${db.clinics.length} clinics, ${db.users.length} users, ${db.appointments.length} appointments)`,
@@ -347,178 +363,430 @@ export async function initPersistence(): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Saving. The app keeps its working data in memory and mirrors it to PostgreSQL. Each save used to
+// TRUNCATE every table and re-insert every row, so a save got slower with every message ever stored
+// (about 5 s at 5,000 messages) and every incoming WhatsApp webhook waits for a save. Now a save
+// writes only the rows that were added, changed or removed since the previous save.
+//
+// How: after each save (and after loading at startup) we remember the JSON of every row. At the next
+// save we compare, so no code that changes data has to say what it changed. Bursts of saves are
+// combined into one. If a set of changes cannot be applied row by row (for example two confirmed
+// appointments swapping slots, which the unique index forbids mid-way), we fall back to the old full
+// rewrite, which always produces a consistent database.
+// ---------------------------------------------------------------------------------------------
+
+type Row = Record<string, any>;
+
+interface TableSpec {
+  table: string;
+  /** primary key column */
+  pk: string;
+  /** other columns, in the order `vals` returns them; the full row JSON goes in `data` */
+  cols: string[];
+  rows: (now: number) => Iterable<Row>;
+  key: (r: Row) => string | number;
+  vals: (r: Row) => any[];
+}
+
+const AUDIT_ROWS_KEPT = 5000;
+const byId = (r: Row) => r.id;
+
+const SPECS: TableSpec[] = [
+  {
+    table: "clinics",
+    pk: "id",
+    cols: ["name", "doctor", "phone", "address", "timezone", "fee", "plan", "number_id", "enabled"],
+    rows: () => db.clinics,
+    key: byId,
+    vals: (c) => [c.name, c.doctor, c.phone, c.address, c.timezone, c.fee, c.plan, c.number_id, c.enabled],
+  },
+  {
+    table: "users",
+    pk: "id",
+    cols: ["username", "email", "clerk_user_id", "role", "clinic_id", "active"],
+    rows: () => db.users,
+    key: byId,
+    vals: (u) => [u.username, u.email || null, u.clerk_user_id || null, u.role, u.clinic_id, u.active],
+  },
+  {
+    table: "login_sessions",
+    pk: "token_hash",
+    cols: ["user_id", "expires"],
+    rows: (now) => [...db.sessions.values()].filter((s) => s.expires > now),
+    key: (s) => s.token_hash,
+    vals: (s) => [s.user_id, s.expires],
+  },
+  {
+    table: "doctors",
+    pk: "id",
+    cols: ["clinic_id", "name", "active"],
+    rows: () => db.doctors,
+    key: byId,
+    vals: (d) => [d.clinic_id, d.name, d.active],
+  },
+  {
+    table: "services",
+    pk: "id",
+    cols: ["clinic_id", "name", "duration", "fee", "active"],
+    rows: () => db.services,
+    key: byId,
+    vals: (s) => [s.clinic_id, s.name, s.duration, s.fee, s.active],
+  },
+  {
+    table: "threads",
+    pk: "id",
+    cols: ["clinic_id", "contact", "channel", "mode", "updated"],
+    rows: () => db.threads,
+    key: byId,
+    vals: (t) => [t.clinic_id, t.contact, t.channel, t.mode, t.updated],
+  },
+  {
+    table: "messages",
+    pk: "id",
+    cols: ["thread_id", "direction", "provider_id", "status", "created"],
+    rows: () => db.messages,
+    key: byId,
+    vals: (m) => [m.thread_id, m.direction, m.provider_id, m.status, m.created],
+  },
+  {
+    table: "jobs",
+    pk: "id",
+    cols: ["clinic_id", "key", "kind", "status", "due"],
+    rows: () => db.jobs,
+    key: byId,
+    vals: (j) => [j.clinic_id, j.key, j.kind, j.status, j.due],
+  },
+  {
+    table: "appointments",
+    pk: "id",
+    cols: ["clinic_id", "doctor_id", "service_id", "contact", "starts", "ends", "status", "source"],
+    rows: () => db.appointments,
+    key: byId,
+    vals: (a) => [a.clinic_id, a.doctor_id, a.service_id, a.contact, a.starts, a.ends, a.status, a.source],
+  },
+  {
+    table: "slot_holds",
+    pk: "id",
+    cols: ["clinic_id", "doctor_id", "thread_id", "starts", "ends", "expires"],
+    rows: (now) => db.holds.filter((h) => h.expires > now),
+    key: byId,
+    vals: (h) => [h.clinic_id, h.doctor_id, h.thread_id, h.starts, h.ends, h.expires],
+  },
+  {
+    table: "waitlist_entries",
+    pk: "id",
+    cols: ["clinic_id", "contact", "status", "created"],
+    rows: () => db.waitlist,
+    key: byId,
+    vals: (w) => [w.clinic_id, w.contact, w.status, w.created],
+  },
+  {
+    table: "enquiries",
+    pk: "id",
+    cols: ["clinic_id", "contact", "status", "source", "next_followup", "last_activity"],
+    rows: () => db.enquiries,
+    key: byId,
+    vals: (e) => [e.clinic_id, e.contact, e.status, e.source, e.next_followup, e.last_activity],
+  },
+  {
+    table: "sales_leads",
+    pk: "id",
+    cols: ["name", "clinic_name", "status", "created"],
+    rows: () => db.leads,
+    key: byId,
+    vals: (l) => [l.name, l.clinic_name, l.status, l.created],
+  },
+  {
+    table: "audits",
+    pk: "id",
+    cols: ["clinic_id", "actor", "action", "created"],
+    rows: () => db.audits.slice(-AUDIT_ROWS_KEPT),
+    key: byId,
+    vals: (a) => [a.clinic_id, a.actor, a.action, a.created],
+  },
+  {
+    table: "reviews",
+    pk: "id",
+    cols: ["clinic_id", "appointment_id", "rating", "status", "created"],
+    rows: () => db.reviews,
+    key: byId,
+    vals: (r) => [r.clinic_id, r.appointment_id, r.rating, r.status, r.created],
+  },
+  {
+    table: "voice_calls",
+    pk: "id",
+    cols: ["clinic_id", "call_id", "direction", "provider", "duration_seconds", "billable_minutes", "outcome", "created"],
+    rows: () => db.voice_calls,
+    key: byId,
+    vals: (v) => [v.clinic_id, v.call_id, v.direction, v.provider, v.duration_seconds, v.billable_minutes, v.outcome, v.created],
+  },
+  {
+    table: "recall_campaigns",
+    pk: "id",
+    cols: ["clinic_id", "kind", "created"],
+    rows: () => db.recall_campaigns,
+    key: byId,
+    vals: (r) => [r.clinic_id, r.kind, r.created],
+  },
+  {
+    table: "recall_dispatches",
+    pk: "id",
+    cols: ["clinic_id", "campaign_id", "contact", "status", "created"],
+    rows: () => db.recall_dispatches,
+    key: byId,
+    vals: (r) => [r.clinic_id, r.campaign_id, r.contact, r.status, r.created],
+  },
+  {
+    table: "queue_tokens",
+    pk: "id",
+    cols: ["clinic_id", "date", "session_id", "token_number", "status", "created"],
+    rows: () => db.queue_tokens,
+    key: byId,
+    vals: (q) => [q.clinic_id, q.date, q.session_id, q.token_number, q.status, q.created],
+  },
+];
+
+type Key = string | number;
+type Snapshot = Map<Key, string>;
+
+/** JSON of every row as of the last successful save, per table; "deliveries" holds the dedupe keys. */
+let snapshots = new Map<string, Snapshot>();
+
+const stats = { flushes: 0, fullRewrites: 0, lastFlushMs: 0, lastRowsWritten: 0 };
+export function persistenceStats(): { flushes: number; fullRewrites: number; lastFlushMs: number; lastRowsWritten: number } {
+  return { ...stats };
+}
+
+interface TableDiff {
+  spec: TableSpec;
+  /** rows that already exist in the database and changed */
+  updates: any[][];
+  /** rows that are new */
+  inserts: any[][];
+  removed: Key[];
+  next: Snapshot;
+}
+
+function diffTable(spec: TableSpec, now: number): TableDiff {
+  const prev = snapshots.get(spec.table) || new Map<Key, string>();
+  const next: Snapshot = new Map();
+  const updates: any[][] = [];
+  const inserts: any[][] = [];
+  for (const row of spec.rows(now)) {
+    const k = spec.key(row);
+    const json = JSON.stringify(row);
+    next.set(k, json);
+    if (prev.get(k) === json) continue;
+    const params = [k, ...spec.vals(row), json];
+    (prev.has(k) ? updates : inserts).push(params);
+  }
+  const removed: Key[] = [];
+  for (const k of prev.keys()) if (!next.has(k)) removed.push(k);
+  return { spec, updates, inserts, removed, next };
+}
+
+function diffDeliveries(): { added: string[]; removed: string[]; next: Snapshot } {
+  const prev = snapshots.get("deliveries") || new Map<Key, string>();
+  const next: Snapshot = new Map();
+  const added: string[] = [];
+  for (const k of db.deliveries) {
+    next.set(k, "1");
+    if (!prev.has(k)) added.push(k);
+  }
+  const removed: string[] = [];
+  for (const k of prev.keys()) if (!next.has(k)) removed.push(String(k));
+  return { added, removed, next };
+}
+
+function upsertSql(spec: TableSpec, rowCount: number): string {
+  const columns = [spec.pk, ...spec.cols, "data"];
+  const width = columns.length;
+  const tuples: string[] = [];
+  for (let r = 0; r < rowCount; r++) {
+    tuples.push(`(${columns.map((_, i) => `$${r * width + i + 1}`).join(",")})`);
+  }
+  const setList = [...spec.cols, "data"].map((c) => `${c} = EXCLUDED.${c}`).join(", ");
+  return `INSERT INTO ${spec.table} (${columns.join(",")}) VALUES ${tuples.join(",")} ON CONFLICT (${spec.pk}) DO UPDATE SET ${setList}`;
+}
+
+const MAX_PARAMS = 30_000;
+async function upsertRows(client: any, spec: TableSpec, rows: any[][]): Promise<void> {
+  if (rows.length === 0) return;
+  const width = spec.cols.length + 2;
+  const perStatement = Math.max(1, Math.min(500, Math.floor(MAX_PARAMS / width)));
+  for (let i = 0; i < rows.length; i += perStatement) {
+    const chunk = rows.slice(i, i + perStatement);
+    await client.query(upsertSql(spec, chunk.length), chunk.flat());
+  }
+}
+
+async function deleteKeys(client: any, table: string, pk: string, keys: Key[]): Promise<void> {
+  for (let i = 0; i < keys.length; i += 5000) {
+    await client.query(`DELETE FROM ${table} WHERE ${pk} = ANY($1)`, [keys.slice(i, i + 5000)]);
+  }
+}
+
+async function writeMeta(client: any, now: number): Promise<void> {
+  await client.query(
+    `INSERT INTO jyutrix_meta (key, value, updated_at) VALUES ('sequences', $1, $2)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
+    [db.exportSequences(), now],
+  );
+  await client.query(
+    `INSERT INTO jyutrix_meta (key, value, updated_at) VALUES ('worker_heartbeat', $1, $2)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
+    [JSON.stringify({ seen: db.workerHeartbeat }), now],
+  );
+}
+
+let lastCleanup = 0;
+/** Rows the app has stopped using that would otherwise stay in the database for good. */
+async function removeStaleRows(client: any, now: number, force = false): Promise<void> {
+  if (!force && now - lastCleanup < 60) return;
+  lastCleanup = now;
+  await client.query("DELETE FROM login_sessions WHERE expires <= $1", [now]);
+  await client.query("DELETE FROM slot_holds WHERE expires <= $1", [now]);
+  if (db.audits.length > AUDIT_ROWS_KEPT) {
+    const firstKept = db.audits[db.audits.length - AUDIT_ROWS_KEPT].id;
+    await client.query("DELETE FROM audits WHERE id < $1", [firstKept]);
+  }
+}
+
+function rememberSnapshots(diffs: TableDiff[], deliveries: Snapshot): void {
+  const next = new Map<string, Snapshot>();
+  for (const d of diffs) next.set(d.spec.table, d.next);
+  next.set("deliveries", deliveries);
+  snapshots = next;
+}
+
+/** Row-by-row save of everything that changed since the previous save. */
+async function saveChanges(client: any, now: number): Promise<{ written: number; diffs: TableDiff[]; deliveries: Snapshot }> {
+  const diffs = SPECS.map((spec) => diffTable(spec, now));
+  const del = diffDeliveries();
+  let written = 0;
+
+  await client.query("BEGIN");
+  // Order matters for unique indexes: free things up first, then change, then add.
+  for (const d of diffs) {
+    await deleteKeys(client, d.spec.table, d.spec.pk, d.removed);
+    written += d.removed.length;
+  }
+  if (del.removed.length) await deleteKeys(client, "deliveries", "key", del.removed);
+  for (const d of diffs) {
+    await upsertRows(client, d.spec, d.updates);
+    written += d.updates.length;
+  }
+  for (const d of diffs) {
+    await upsertRows(client, d.spec, d.inserts);
+    written += d.inserts.length;
+  }
+  for (let i = 0; i < del.added.length; i += 5000) {
+    await client.query("INSERT INTO deliveries (key, created) SELECT unnest($1::text[]), $2 ON CONFLICT DO NOTHING", [del.added.slice(i, i + 5000), now]);
+  }
+  written += del.added.length;
+  await removeStaleRows(client, now);
+  await writeMeta(client, now);
+  await client.query("COMMIT");
+  return { written, diffs, deliveries: del.next };
+}
+
+/** The original save: wipe every table and write everything again. Slow, but always consistent. */
+async function rewriteEverything(client: any, now: number): Promise<{ written: number; diffs: TableDiff[]; deliveries: Snapshot }> {
+  // Treat every row as new by diffing against an empty snapshot.
+  const saved = snapshots;
+  snapshots = new Map();
+  let diffs: TableDiff[];
+  let del: ReturnType<typeof diffDeliveries>;
+  try {
+    diffs = SPECS.map((spec) => diffTable(spec, now));
+    del = diffDeliveries();
+  } finally {
+    snapshots = saved;
+  }
+  let written = 0;
+  await client.query("BEGIN");
+  await client.query(`TRUNCATE ${SPECS.map((s) => s.table).join(", ")}, deliveries`);
+  for (const d of diffs) {
+    await upsertRows(client, d.spec, d.inserts);
+    written += d.inserts.length;
+  }
+  for (let i = 0; i < del.added.length; i += 5000) {
+    await client.query("INSERT INTO deliveries (key, created) SELECT unnest($1::text[]), $2 ON CONFLICT DO NOTHING", [del.added.slice(i, i + 5000), now]);
+  }
+  written += del.added.length;
+  await removeStaleRows(client, now, true);
+  await writeMeta(client, now);
+  await client.query("COMMIT");
+  return { written, diffs, deliveries: del.next };
+}
+
 async function flushNow(): Promise<void> {
   if (!pool || !initialized) return;
   const client = await pool.connect();
+  const started = performance.now();
   const now = nowSec();
   try {
-    await client.query("BEGIN");
-
-    await client.query(
-      "TRUNCATE clinics, users, login_sessions, doctors, services, threads, messages, jobs, appointments, slot_holds, waitlist_entries, enquiries, sales_leads, audits, reviews, voice_calls, recall_campaigns, recall_dispatches, queue_tokens, deliveries",
-    );
-
-    for (const c of db.clinics) {
-      await client.query(
-        "INSERT INTO clinics (id, name, doctor, phone, address, timezone, fee, plan, number_id, enabled, data) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
-        [c.id, c.name, c.doctor, c.phone, c.address, c.timezone, c.fee, c.plan, c.number_id, c.enabled, c],
+    let result;
+    try {
+      result = await saveChanges(client, now);
+    } catch (err: any) {
+      await client.query("ROLLBACK").catch(() => {});
+      console.warn(
+        `[Jyutrix] Saving only the changed rows failed (${err?.code || ""} ${err?.message || err}); rewriting the whole database instead.`,
       );
-    }
-    for (const u of db.users) {
-      await client.query(
-        "INSERT INTO users (id, username, email, clerk_user_id, role, clinic_id, active, data) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
-        [u.id, u.username, u.email || null, u.clerk_user_id || null, u.role, u.clinic_id, u.active, u],
-      );
-    }
-    for (const s of db.sessions.values()) {
-      if (s.expires > now) {
-        await client.query(
-          "INSERT INTO login_sessions (token_hash, user_id, expires, data) VALUES ($1,$2,$3,$4)",
-          [s.token_hash, s.user_id, s.expires, s],
-        );
+      try {
+        result = await rewriteEverything(client, now);
+        stats.fullRewrites += 1;
+      } catch (err2) {
+        await client.query("ROLLBACK").catch(() => {});
+        console.error("[Jyutrix] Failed to persist state to PostgreSQL:", err2);
+        throw err2;
       }
     }
-    for (const d of db.doctors) {
-      await client.query(
-        "INSERT INTO doctors (id, clinic_id, name, active, data) VALUES ($1,$2,$3,$4,$5)",
-        [d.id, d.clinic_id, d.name, d.active, d],
-      );
+    rememberSnapshots(result.diffs, result.deliveries);
+    stats.flushes += 1;
+    stats.lastRowsWritten = result.written;
+    stats.lastFlushMs = Math.round(performance.now() - started);
+    if (stats.lastFlushMs > 1000) {
+      console.warn(`[Jyutrix] Slow save: ${stats.lastFlushMs} ms for ${result.written} changed rows.`);
     }
-    for (const s of db.services) {
-      await client.query(
-        "INSERT INTO services (id, clinic_id, name, duration, fee, active, data) VALUES ($1,$2,$3,$4,$5,$6,$7)",
-        [s.id, s.clinic_id, s.name, s.duration, s.fee, s.active, s],
-      );
-    }
-    for (const t of db.threads) {
-      await client.query(
-        "INSERT INTO threads (id, clinic_id, contact, channel, mode, updated, data) VALUES ($1,$2,$3,$4,$5,$6,$7)",
-        [t.id, t.clinic_id, t.contact, t.channel, t.mode, t.updated, t],
-      );
-    }
-    for (const m of db.messages) {
-      await client.query(
-        "INSERT INTO messages (id, thread_id, direction, provider_id, status, created, data) VALUES ($1,$2,$3,$4,$5,$6,$7)",
-        [m.id, m.thread_id, m.direction, m.provider_id, m.status, m.created, m],
-      );
-    }
-    for (const j of db.jobs) {
-      await client.query(
-        "INSERT INTO jobs (id, clinic_id, key, kind, status, due, data) VALUES ($1,$2,$3,$4,$5,$6,$7)",
-        [j.id, j.clinic_id, j.key, j.kind, j.status, j.due, j],
-      );
-    }
-    for (const a of db.appointments) {
-      await client.query(
-        "INSERT INTO appointments (id, clinic_id, doctor_id, service_id, contact, starts, ends, status, source, data) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
-        [a.id, a.clinic_id, a.doctor_id, a.service_id, a.contact, a.starts, a.ends, a.status, a.source, a],
-      );
-    }
-    for (const h of db.holds) {
-      if (h.expires > now) {
-        await client.query(
-          "INSERT INTO slot_holds (id, clinic_id, doctor_id, thread_id, starts, ends, expires, data) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
-          [h.id, h.clinic_id, h.doctor_id, h.thread_id, h.starts, h.ends, h.expires, h],
-        );
-      }
-    }
-    for (const w of db.waitlist) {
-      await client.query(
-        "INSERT INTO waitlist_entries (id, clinic_id, contact, status, created, data) VALUES ($1,$2,$3,$4,$5,$6)",
-        [w.id, w.clinic_id, w.contact, w.status, w.created, w],
-      );
-    }
-    for (const e of db.enquiries) {
-      await client.query(
-        "INSERT INTO enquiries (id, clinic_id, contact, status, source, next_followup, last_activity, data) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
-        [e.id, e.clinic_id, e.contact, e.status, e.source, e.next_followup, e.last_activity, e],
-      );
-    }
-    for (const l of db.leads) {
-      await client.query(
-        "INSERT INTO sales_leads (id, name, clinic_name, status, created, data) VALUES ($1,$2,$3,$4,$5,$6)",
-        [l.id, l.name, l.clinic_name, l.status, l.created, l],
-      );
-    }
-    for (const a of db.audits.slice(-5000)) {
-      await client.query(
-        "INSERT INTO audits (id, clinic_id, actor, action, created, data) VALUES ($1,$2,$3,$4,$5,$6)",
-        [a.id, a.clinic_id, a.actor, a.action, a.created, a],
-      );
-    }
-    for (const r of db.reviews) {
-      await client.query(
-        "INSERT INTO reviews (id, clinic_id, appointment_id, rating, status, created, data) VALUES ($1,$2,$3,$4,$5,$6,$7)",
-        [r.id, r.clinic_id, r.appointment_id, r.rating, r.status, r.created, r],
-      );
-    }
-    for (const vc of db.voice_calls) {
-      await client.query(
-        "INSERT INTO voice_calls (id, clinic_id, call_id, direction, provider, duration_seconds, billable_minutes, outcome, created, data) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
-        [
-          vc.id,
-          vc.clinic_id,
-          vc.call_id,
-          vc.direction,
-          vc.provider,
-          vc.duration_seconds,
-          vc.billable_minutes,
-          vc.outcome,
-          vc.created,
-          vc,
-        ],
-      );
-    }
-    for (const rc of db.recall_campaigns) {
-      await client.query(
-        "INSERT INTO recall_campaigns (id, clinic_id, kind, created, data) VALUES ($1,$2,$3,$4,$5)",
-        [rc.id, rc.clinic_id, rc.kind, rc.created, rc],
-      );
-    }
-    for (const rd of db.recall_dispatches) {
-      await client.query(
-        "INSERT INTO recall_dispatches (id, clinic_id, campaign_id, contact, status, created, data) VALUES ($1,$2,$3,$4,$5,$6,$7)",
-        [rd.id, rd.clinic_id, rd.campaign_id, rd.contact, rd.status, rd.created, rd],
-      );
-    }
-    for (const qt of db.queue_tokens) {
-      await client.query(
-        "INSERT INTO queue_tokens (id, clinic_id, date, session_id, token_number, status, created, data) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
-        [qt.id, qt.clinic_id, qt.date, qt.session_id, qt.token_number, qt.status, qt.created, qt],
-      );
-    }
-    for (const k of db.deliveries) {
-      await client.query(
-        "INSERT INTO deliveries (key, created) VALUES ($1,$2) ON CONFLICT DO NOTHING",
-        [k, now],
-      );
-    }
-
-    await client.query(
-      `INSERT INTO jyutrix_meta (key, value, updated_at) VALUES ('sequences', $1, $2)
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
-      [db.exportSequences(), now],
-    );
-    await client.query(
-      `INSERT INTO jyutrix_meta (key, value, updated_at) VALUES ('worker_heartbeat', $1, $2)
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
-      [JSON.stringify({ seen: db.workerHeartbeat }), now],
-    );
-
-    await client.query("COMMIT");
-  } catch (err) {
-    await client.query("ROLLBACK").catch(() => {});
-    console.error("[Jyutrix] Failed to persist state to PostgreSQL:", err);
-    throw err;
   } finally {
     client.release();
   }
 }
 
+let flushing: Promise<void> | null = null;
+let queued: Promise<void> | null = null;
+
+/** Saves memory to PostgreSQL. Callers that arrive while a save is running share one follow-up save. */
 export function persistState(): Promise<void> {
   if (!pool || !initialized) return Promise.resolve();
-  persistQueue = persistQueue.then(flushNow, flushNow);
-  return persistQueue;
+  if (!flushing) {
+    flushing = flushNow().finally(() => {
+      flushing = null;
+    });
+    return flushing;
+  }
+  if (!queued) {
+    queued = flushing
+      .catch(() => {})
+      .then(() => {
+        queued = null;
+        return persistState();
+      });
+  }
+  return queued;
+}
+
+export async function closePersistence(): Promise<void> {
+  const p = pool;
+  pool = null;
+  initialized = false;
+  snapshots = new Map();
+  flushing = null;
+  queued = null;
+  if (p) await p.end().catch(() => {});
 }
 
 export async function checkDatabaseHealth(): Promise<void> {

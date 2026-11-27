@@ -41,3 +41,15 @@ Follow-ups are staff reminders computed from `next_followup`; due times are move
 `backend/app/reports.py` builds the Performance report on demand in the clinic's time zone from live (non-demo) enquiries, appointments and jobs, and exports it as formula-safe CSV. `backend/app/readiness.py` computes the go-live checklist from real records plus owner-ticked agreements stored on the clinic (`onboarding`); it guides but does not lock the Clinic settings form.
 
 The global voice tool key is a trusted server-to-server integration credential with access to all configured clinic tools; do not give it to clinic users. Configure fixed clinic IDs in trusted agent definitions and issue clinic-specific credentials before offering self-service voice onboarding.
+
+## Saving data
+
+The app keeps its working data in memory and mirrors it to PostgreSQL (`src/persistence.ts`). A save writes only the rows that were added, changed or removed since the previous save:
+
+- After loading at startup and after every save, the app remembers the JSON of each row. The next save compares and writes the difference, so code that changes data does not need to say what it changed.
+- Saves that arrive while one is running share a single follow-up save.
+- If a set of changes cannot be applied row by row (for example two confirmed appointments swapping slots, which the unique slot index forbids part-way), the save falls back to the original full rewrite inside one transaction. This is logged as a warning.
+- A save takes roughly 15 ms with 5,000 stored messages and 125 ms with 100,000 (measured on a laptop; it grows slowly because every row is compared in memory). The previous behaviour rewrote every table on every save, about 5 s at 5,000 messages.
+- Expired sessions and slot holds, and audit entries beyond the latest 5,000, are removed from the database.
+
+Every incoming WhatsApp webhook waits for a save before it is acknowledged, so save time directly affects webhook response time (Kapso expects an answer within 10 seconds). `npm test` runs database tests when `TEST_DATABASE_URL` points at a throwaway PostgreSQL.

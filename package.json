@@ -13,7 +13,7 @@
     "build": "tsc --noEmit",
     "lint": "tsc --noEmit && node --check frontend/app.js && node --check frontend/marketing.js",
     "check": "node --check frontend/app.js",
-    "test": "node --import tsx --test tests/kapso-webhook.test.ts"
+    "test": "node --import tsx --test tests/*.test.ts"
   },
   "dependencies": {
     "@clerk/backend": "^3.31.3",

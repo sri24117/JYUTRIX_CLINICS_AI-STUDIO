@@ -12,9 +12,13 @@ import {
   KAPSO_API_KEY,
   KAPSO_WEBHOOK_SECRET,
   OPENAI_API_KEY,
+  Service,
+  TokenSessionConfig,
+  VERTICAL_PRESETS,
   VOICE_TOOL_KEY,
   db,
   defaultSchedule,
+  defaultTokenSessions,
   digestToken,
   ensureCatalog,
   hashPassword,
@@ -28,6 +32,10 @@ import {
   available,
   book,
   cancelReminders,
+  createSlotHold,
+  dayTimeline,
+  defaultDoctor,
+  defaultService,
   localParts,
   parseDateStr,
   readable,
@@ -44,7 +52,25 @@ import {
   createManualEnquiry,
   followupQueue,
 } from "./src/enquiries.js";
-import { inbound, offerWaitlistForSlot, queueReply, takeover } from "./src/receptionist.js";
+import {
+  answerPublicClinicQuestion,
+  getThread,
+  inbound,
+  offerWaitlistForSlot,
+  queueReply,
+  takeover,
+  triggerPostVisitReview,
+} from "./src/receptionist.js";
+import { answerCopilotQuestion } from "./src/copilot.js";
+import {
+  VOICE_PACKS,
+  normalizeVoiceWebhookPayload,
+  packById,
+  recordVoiceCall,
+  voiceUsageForMonth,
+} from "./src/voice.js";
+import { RECALL_TEMPLATES, findRecallCandidates, launchRecallCampaign } from "./src/recalls.js";
+import { advanceQueueSession, getQueueBoard, getTokenSessions, issueQueueToken } from "./src/queue.js";
 import { computeReadiness, enableAutomation, setSignoff } from "./src/readiness.js";
 import { exportPerformanceCsv, performanceReport, resolvePeriod } from "./src/reports.js";
 import { normalizeKapsoPayload, normalizeMetaPayload, verifyKapsoSignature, webhookPayloadKind } from "./src/kapso.js";
@@ -221,6 +247,84 @@ function intParam(value: unknown, name = "id"): number {
   return n;
 }
 
+function sanitizeReviewUrl(raw: unknown): string | null {
+  const value = String(raw ?? "").trim();
+  if (!value) return null;
+  if (value.length > 500) {
+    throw new HttpError(422, "Google review link is too long");
+  }
+  try {
+    const parsed = new URL(value);
+    if (!["https:", "http:"].includes(parsed.protocol)) {
+      throw new HttpError(422, "Google review link must start with https:// or http://");
+    }
+    return parsed.toString();
+  } catch (err) {
+    if (err instanceof HttpError) throw err;
+    throw new HttpError(422, "Google review link must be a valid https:// URL");
+  }
+}
+
+function applyPresetToClinic(clinic: Clinic, presetId: string, replaceFaqs = false) {
+  const preset = VERTICAL_PRESETS.find((p) => p.id === presetId);
+  if (!preset) {
+    throw new HttpError(404, "Unknown specialty preset");
+  }
+  ensureCatalog(clinic);
+  const limits = limitsFor(clinic);
+  const existingNames = new Set(
+    db.services
+      .filter((s) => s.clinic_id === clinic.id)
+      .map((s) => s.name.trim().toLowerCase()),
+  );
+  let activeCount = db.services.filter((s) => s.clinic_id === clinic.id && s.active).length;
+  let addedServices = 0;
+  let skippedCap = 0;
+
+  for (const item of preset.services) {
+    const key = item.name.trim().toLowerCase();
+    if (existingNames.has(key)) continue;
+    if (activeCount >= limits.max_services) {
+      skippedCap += 1;
+      continue;
+    }
+    const created: Service = {
+      id: db.nextId("services"),
+      clinic_id: clinic.id,
+      name: item.name,
+      duration: item.duration,
+      fee: item.fee,
+      active: true,
+    };
+    db.services.push(created);
+    existingNames.add(key);
+    activeCount += 1;
+    addedServices += 1;
+  }
+
+  const labelSet = new Set((clinic.services || []).map((s) => s.trim().toLowerCase()));
+  for (const item of preset.services) {
+    if (!labelSet.has(item.name.trim().toLowerCase())) {
+      clinic.services.push(item.name);
+      labelSet.add(item.name.trim().toLowerCase());
+    }
+  }
+
+  if (replaceFaqs) {
+    clinic.faqs = preset.faqs.map((f) => ({ ...f }));
+  } else {
+    const existingQs = new Set((clinic.faqs || []).map((f) => f.question.trim().toLowerCase()));
+    for (const faq of preset.faqs) {
+      if (!existingQs.has(faq.question.trim().toLowerCase())) {
+        clinic.faqs.push({ ...faq });
+        existingQs.add(faq.question.trim().toLowerCase());
+      }
+    }
+  }
+  clinic.vertical = preset.id;
+  return { preset, addedServices, skippedCap };
+}
+
 function clinicDict(c: Clinic) {
   return {
     id: c.id,
@@ -241,6 +345,19 @@ function clinicDict(c: Clinic) {
     monthly_fee: c.monthly_fee,
     monthly_limit: c.monthly_limit,
     pilot_end: c.pilot_end,
+    staff_phones: c.staff_phones || [],
+    vertical: c.vertical || "dental",
+    google_review_url: c.google_review_url || null,
+    review_requests_enabled: c.review_requests_enabled !== false,
+    voice_pack: c.voice_pack || "none",
+    voice_minutes_included: c.voice_minutes_included ?? packById(c.voice_pack).minutes,
+    voice_extra_rate: c.voice_extra_rate ?? 15,
+    voice_cost_per_min: c.voice_cost_per_min ?? 6,
+    voice_alert_threshold_pct: c.voice_alert_threshold_pct ?? 80,
+    booking_mode: c.booking_mode || "slots",
+    token_sessions: getTokenSessions(c),
+    widget_enabled: c.widget_enabled !== false,
+    widget_greeting: c.widget_greeting || "",
   };
 }
 
@@ -256,6 +373,7 @@ function apptDict(a: Appointment, c: Clinic) {
     ends: a.ends,
     status: a.status,
     source: a.source,
+    is_quick_block: a.request_key.startsWith("quick-block:") || a.request_key.startsWith("staff-wa:"),
     paid_amount: a.paid_amount,
     reminder_response: a.reminder_response,
     reminder_response_at: a.reminder_response_at,
@@ -289,6 +407,13 @@ app.get("/", (_req, res) => {
 
 app.get(["/app", "/app/"], (_req, res) => {
   res.sendFile(path.join(FRONTEND_DIR, "index.html"));
+});
+
+app.get("/widget.js", (_req, res) => {
+  res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+  res.setHeader("Cache-Control", "public, max-age=300");
+  res.sendFile(path.join(FRONTEND_DIR, "widget.js"));
 });
 
 app.use("/static", express.static(FRONTEND_DIR));
@@ -565,9 +690,13 @@ app.post(
     if (b.close) sched.close = String(b.close);
     if (b.duration) sched.duration = Math.max(5, Math.min(120, Number(b.duration)));
 
+    const verticalId = String(b.vertical || "dental").trim();
+    const matchedPreset = VERTICAL_PRESETS.find((p) => p.id === verticalId) || null;
     const services = Array.isArray(b.services) && b.services.length
       ? b.services.map((s: any) => String(s).trim()).filter(Boolean)
-      : ["General consultation"];
+      : matchedPreset
+        ? matchedPreset.services.map((s) => s.name)
+        : ["General consultation"];
 
     const clinic: Clinic = {
       id: db.nextId("clinics"),
@@ -576,7 +705,7 @@ app.post(
       phone,
       address,
       timezone: String(b.timezone || "Asia/Kolkata"),
-      fee: Math.max(0, Number(b.fee ?? 500)),
+      fee: Math.max(0, Number(b.fee ?? matchedPreset?.default_fee ?? 500)),
       schedule: sched,
       services,
       faqs: [
@@ -596,9 +725,24 @@ app.post(
       followup_hours: 4,
       baseline: null,
       onboarding: {},
+      staff_phones: Array.isArray(b.staff_phones)
+        ? b.staff_phones.map((p: any) => String(p).trim()).filter(Boolean)
+        : [],
+      vertical: matchedPreset ? matchedPreset.id : "dental",
+      google_review_url: sanitizeReviewUrl(b.google_review_url),
+      review_requests_enabled: b.review_requests_enabled !== false,
+      booking_mode: ["slots", "tokens", "hybrid"].includes(String(b.booking_mode))
+        ? (String(b.booking_mode) as Clinic["booking_mode"])
+        : "hybrid",
+      token_sessions: defaultTokenSessions(),
+      widget_enabled: true,
+      widget_greeting: `Hi! Welcome to ${name}. Ask about fees, timings, or services—or book on WhatsApp.`,
     };
     db.clinics.push(clinic);
     ensureCatalog(clinic);
+    if (matchedPreset) {
+      applyPresetToClinic(clinic, matchedPreset.id, false);
+    }
 
     if (user.role !== "admin") {
       user.clinic_id = clinic.id;
@@ -651,6 +795,18 @@ app.post(
       followup_hours: 4,
       baseline: null,
       onboarding: {},
+      staff_phones: Array.isArray(b.staff_phones)
+        ? b.staff_phones.map((p: any) => String(p).trim()).filter(Boolean)
+        : [],
+      vertical: String(b.vertical || "dental").trim() || "dental",
+      google_review_url: sanitizeReviewUrl(b.google_review_url),
+      review_requests_enabled: b.review_requests_enabled !== false,
+      booking_mode: ["slots", "tokens", "hybrid"].includes(String(b.booking_mode))
+        ? (String(b.booking_mode) as Clinic["booking_mode"])
+        : "hybrid",
+      token_sessions: defaultTokenSessions(),
+      widget_enabled: b.widget_enabled !== false,
+      widget_greeting: String(b.widget_greeting || "").trim().slice(0, 300),
     };
     if (!clinic.name || !clinic.doctor || !clinic.phone || !clinic.address) {
       throw new HttpError(422, "Name, doctor, phone, and address are required");
@@ -694,6 +850,27 @@ app.put(
     if (b.schedule) clinic.schedule = b.schedule;
     if (Array.isArray(b.services)) clinic.services = b.services;
     if (Array.isArray(b.faqs)) clinic.faqs = b.faqs;
+    if (Array.isArray(b.staff_phones)) {
+      clinic.staff_phones = b.staff_phones.map((p: any) => String(p).trim()).filter(Boolean).slice(0, 20);
+    }
+    if (b.vertical !== undefined) {
+      clinic.vertical = String(b.vertical || "dental").trim().slice(0, 40) || "dental";
+    }
+    if (b.google_review_url !== undefined) {
+      clinic.google_review_url = sanitizeReviewUrl(b.google_review_url);
+    }
+    if (b.review_requests_enabled !== undefined) {
+      clinic.review_requests_enabled = Boolean(b.review_requests_enabled);
+    }
+    if (b.widget_enabled !== undefined) {
+      clinic.widget_enabled = Boolean(b.widget_enabled);
+    }
+    if (b.widget_greeting !== undefined) {
+      clinic.widget_greeting = String(b.widget_greeting || "").trim().slice(0, 300);
+    }
+    if (b.booking_mode !== undefined && ["slots", "tokens", "hybrid"].includes(String(b.booking_mode))) {
+      clinic.booking_mode = String(b.booking_mode) as Clinic["booking_mode"];
+    }
     clinic.enabled = Boolean(b.enabled);
     clinic.template_approved = Boolean(b.template_approved);
     clinic.reminder_buttons_approved = Boolean(b.reminder_buttons_approved);
@@ -1031,6 +1208,62 @@ app.get(
   }),
 );
 
+// Live day timeline (shows available, 5-min WhatsApp holds, quick-blocked, booked & walk-in priority slots)
+app.get(
+  "/api/schedule/timeline",
+  requireAuth,
+  wrap((req, res) => {
+    const clinicId = intParam(req.query.clinic_id, "clinic_id");
+    checkScope(req.principal!, clinicId);
+    const clinic = db.clinics.find((c) => c.id === clinicId);
+    if (!clinic) throw new HttpError(404, "Clinic not found");
+    const day = req.query.day ? parseDateStr(String(req.query.day)).iso : null;
+    const doctorId = req.query.doctor_id ? intParam(req.query.doctor_id, "doctor_id") : null;
+    const serviceId = req.query.service_id ? intParam(req.query.service_id, "service_id") : null;
+    res.json(dayTimeline(clinic, { targetDate: day, doctorId, serviceId }));
+  }),
+);
+
+// One-tap reception Quick Block (no patient name/phone required — fill in later when desk is quiet)
+app.post(
+  "/api/appointments/quick-block",
+  requireAuth,
+  wrap(async (req, res) => {
+    const b = req.body || {};
+    const clinicId = intParam(b.clinic_id, "clinic_id");
+    checkScope(req.principal!, clinicId);
+    const clinic = db.clinics.find((c) => c.id === clinicId);
+    if (!clinic) throw new HttpError(404, "Clinic not found");
+    if (!b.scheduled_at) {
+      throw new HttpError(422, "Slot time is required");
+    }
+    const kind = b.kind === "phone" ? "Phone call" : "Walk-in";
+    const label = String(b.name || "").trim() || `${kind} — quick block`;
+    const contact = String(b.contact || "").trim().replace(/^\+/, "");
+    const starts = asStamp(String(b.scheduled_at), clinic);
+    const doctorId = b.doctor_id ? Number(b.doctor_id) : null;
+    const serviceId = b.service_id ? Number(b.service_id) : null;
+
+    const a = book(
+      clinic,
+      null,
+      starts,
+      `quick-block:${clinic.id}:${doctorId || 0}:${starts}:${crypto.randomUUID()}`,
+      {
+        source: "staff",
+        name: label,
+        contact,
+        consent: false,
+        doctorId,
+        serviceId,
+      },
+    );
+    db.audit(req.principal!.username, "appointment.quick_blocked", a.id, clinic.id);
+    await persistState();
+    res.status(201).json(apptDict(a, clinic));
+  }),
+);
+
 app.get(
   "/api/appointments",
   requireAuth,
@@ -1133,6 +1366,7 @@ app.patch(
         offerWaitlistForSlot(c, oldStart, oldDoctorId, oldServiceId, a.source === "demo");
       }
     }
+    const prevStatus = a.status;
     if (b.status) {
       if (!["confirmed", "completed", "no_show", "cancelled"].includes(b.status)) {
         throw new HttpError(422, "Invalid status");
@@ -1142,6 +1376,14 @@ app.patch(
       if (a.status === "cancelled") {
         offerWaitlistForSlot(c, a.starts, a.doctor_id, a.service_id, a.source === "demo");
       }
+    }
+    if (b.name !== undefined) {
+      const nextName = String(b.name || "").trim().slice(0, 120);
+      if (!nextName) throw new HttpError(422, "Patient name cannot be empty");
+      a.name = nextName;
+    }
+    if (b.contact !== undefined) {
+      a.contact = String(b.contact || "").trim().replace(/^\+/, "").slice(0, 40);
     }
     if (b.paid_amount !== undefined && b.paid_amount !== null) {
       a.paid_amount = Number(b.paid_amount);
@@ -1157,6 +1399,12 @@ app.patch(
         "staff",
       );
       void runWorkerTick();
+    }
+    if (a.status === "completed" && prevStatus !== "completed" && c.review_requests_enabled !== false) {
+      const review = triggerPostVisitReview(c, a);
+      if (review && a.source !== "demo") {
+        void runWorkerTick();
+      }
     }
     await persistState();
     res.json(apptDict(a, c));
@@ -1906,6 +2154,751 @@ app.post(
     enableAutomation(c, req.principal!.username);
     await persistState();
     res.json(computeReadiness(c));
+  }),
+);
+
+// Vertical Service Presets (1-click specialty catalogs)
+app.get(
+  "/api/vertical-presets",
+  requireAuth,
+  wrap((_req, res) => {
+    res.json(VERTICAL_PRESETS);
+  }),
+);
+
+app.post(
+  "/api/clinics/:clinicId/apply-preset",
+  requireAuth,
+  wrap(async (req, res) => {
+    const clinicId = intParam(req.params.clinicId, "clinic_id");
+    checkScope(req.principal!, clinicId);
+    ownerOrAdmin(req.principal!);
+    const clinic = db.clinics.find((c) => c.id === clinicId);
+    if (!clinic) throw new HttpError(404, "Clinic not found");
+    const presetId = String(req.body?.preset_id || "").trim();
+    const replaceFaqs = Boolean(req.body?.replace_faqs);
+    const { preset, addedServices, skippedCap } = applyPresetToClinic(clinic, presetId, replaceFaqs);
+    db.audit(req.principal!.username, "clinic.preset_applied", preset.id, clinicId);
+    await persistState();
+    res.json({
+      preset: preset.id,
+      label: preset.label,
+      added_services: addedServices,
+      skipped_due_to_plan_cap: skippedCap,
+      clinic: clinicDict(clinic),
+      services: db.services.filter((s) => s.clinic_id === clinicId),
+    });
+  }),
+);
+
+// Post-visit Reviews & Reputation Manager
+app.get(
+  "/api/reviews",
+  requireAuth,
+  wrap((req, res) => {
+    const clinicId = intParam(req.query.clinic_id, "clinic_id");
+    checkScope(req.principal!, clinicId);
+    const clinic = db.clinics.find((c) => c.id === clinicId);
+    if (!clinic) throw new HttpError(404, "Clinic not found");
+    const items = db.reviews
+      .filter((r) => r.clinic_id === clinicId)
+      .sort((a, b) => b.created - a.created);
+    const rated = items.filter((r) => typeof r.rating === "number");
+    const avg = rated.length
+      ? Number((rated.reduce((sum, r) => sum + (r.rating || 0), 0) / rated.length).toFixed(1))
+      : null;
+    res.json({
+      google_review_url: clinic.google_review_url || null,
+      review_requests_enabled: clinic.review_requests_enabled !== false,
+      summary: {
+        total: items.length,
+        responses: rated.length,
+        pending: items.filter((r) => r.status === "requested").length,
+        average_rating: avg,
+        happy_links_sent: items.filter((r) => r.status === "happy_link_sent").length,
+        escalated: items.filter((r) => r.status === "escalated").length,
+      },
+      items,
+    });
+  }),
+);
+
+// Read-only Owner Reporting Copilot (deterministic, clinic-scoped, zero arbitrary SQL)
+app.post(
+  "/api/copilot/query",
+  requireAuth,
+  wrap((req, res) => {
+    ownerOrAdmin(req.principal!);
+    const clinicId = intParam(req.body?.clinic_id, "clinic_id");
+    checkScope(req.principal!, clinicId);
+    const clinic = db.clinics.find((c) => c.id === clinicId);
+    if (!clinic) throw new HttpError(404, "Clinic not found");
+    const question = String(req.body?.question || "").trim();
+    if (!question || question.length > 400) {
+      throw new HttpError(422, "Ask a question between 1 and 400 characters");
+    }
+    const result = answerCopilotQuestion(clinic, question);
+    db.audit(req.principal!.username, "copilot.queried", result.intent, clinic.id);
+    res.json(result);
+  }),
+);
+
+function verifyVoiceBearer(req: Request): void {
+  if (!VOICE_TOOL_KEY) {
+    throw new HttpError(503, "Voice tool API key is not configured on this server");
+  }
+  const authHeader = String(req.headers.authorization || "");
+  const presented = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+  const a = Buffer.from(presented, "utf8");
+  const b = Buffer.from(VOICE_TOOL_KEY, "utf8");
+  if (!presented || a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    throw new HttpError(401, "Invalid voice tool authorization key");
+  }
+}
+
+// Inbound AI Voice Receptionist Tool API (docs/VOICE.md — Vapi / Bolna / Plivo)
+app.post(
+  "/api/voice/tools",
+  wrap(async (req, res) => {
+    verifyVoiceBearer(req);
+
+    const body = req.body || {};
+    const action = String(body.action || "").trim().toLowerCase();
+    const clinicId = intParam(body.clinic_id, "clinic_id");
+    const clinic = db.clinics.find((c) => c.id === clinicId);
+    if (!clinic) throw new HttpError(404, "Clinic not found");
+    const catalog = ensureCatalog(clinic);
+
+    if (action === "info") {
+      res.json({
+        clinic_id: clinic.id,
+        name: clinic.name,
+        doctor: clinic.doctor,
+        phone: clinic.phone,
+        address: clinic.address,
+        timezone: clinic.timezone,
+        fee: clinic.fee,
+        schedule: clinic.schedule,
+        doctors: catalog.doctors.filter((d) => d.active).map((d) => ({ id: d.id, name: d.name })),
+        services: catalog.services
+          .filter((s) => s.active)
+          .map((s) => ({ id: s.id, name: s.name, duration: s.duration, fee: s.fee })),
+        faqs: clinic.faqs,
+        policy:
+          "Read-only approved clinic facts. Do not give medical advice and never cancel or reschedule bookings over unauthenticated phone calls.",
+      });
+      return;
+    }
+
+    if (action === "availability") {
+      const targetDate = body.date ? parseDateStr(String(body.date)).iso : localParts(clinic.timezone, nowSec()).dateStr;
+      const doctor = body.doctor_id
+        ? catalog.doctors.find((d) => d.id === Number(body.doctor_id) && d.active) || defaultDoctor(clinic)
+        : defaultDoctor(clinic);
+      const service = body.service_id
+        ? catalog.services.find((s) => s.id === Number(body.service_id) && s.active) || defaultService(clinic)
+        : defaultService(clinic);
+      const slots = available(clinic, {
+        targetDate,
+        count: 6,
+        doctorId: doctor?.id ?? null,
+        serviceId: service?.id ?? null,
+      });
+      res.json({
+        clinic_id: clinic.id,
+        timezone: clinic.timezone,
+        date: targetDate,
+        doctor: doctor?.name || clinic.doctor,
+        service: service?.name || "Consultation",
+        slots: slots.map((s) => ({
+          starts: s,
+          iso: toLocalIso(clinic, s),
+          label: readable(clinic, s),
+        })),
+      });
+      return;
+    }
+
+    if (action === "request") {
+      const callId = String(body.call_id || "").trim().slice(0, 120);
+      const contact = String(body.contact || "").replace(/\D/g, "").slice(0, 20);
+      const name = String(body.name || "").trim().slice(0, 120);
+      const note = String(body.note || "").trim().slice(0, 500);
+      if (callId.length < 3 || contact.length < 7 || name.length < 2) {
+        throw new HttpError(422, "call_id, valid phone contact, and patient name are required");
+      }
+
+      const idempotencyKey = `voice:${clinic.id}:${callId}`;
+      const existingMsg = db.messages.find((m) => m.provider_id === idempotencyKey);
+      if (existingMsg) {
+        const existingEnquiry = db.enquiries.find(
+          (e) => e.clinic_id === clinic.id && e.thread_id === existingMsg.thread_id,
+        );
+        res.json({
+          status: "pending_staff_confirmation",
+          duplicate: true,
+          call_id: callId,
+          thread_id: existingMsg.thread_id,
+          enquiry_id: existingEnquiry?.id ?? null,
+          slot_held: false,
+          hold_expires: null,
+          message: "Voice request already logged for clinic staff confirmation.",
+        });
+        return;
+      }
+
+      const thread = getThread(clinic, contact, name, "whatsapp");
+      thread.name = name;
+      thread.updated = nowSec();
+
+      const doctor = body.doctor_id
+        ? catalog.doctors.find((d) => d.id === Number(body.doctor_id) && d.active) || defaultDoctor(clinic)
+        : defaultDoctor(clinic);
+      const service = body.service_id
+        ? catalog.services.find((s) => s.id === Number(body.service_id) && s.active) || defaultService(clinic)
+        : defaultService(clinic);
+
+      let requestedStarts: number | null = null;
+      let requestedLabel = "";
+      if (body.scheduled_at) {
+        try {
+          requestedStarts = asStamp(String(body.scheduled_at), clinic);
+          requestedLabel = readable(clinic, requestedStarts);
+        } catch {
+          requestedStarts = null;
+        }
+      }
+
+      const summaryText = `[AI Voice Receptionist · Call ${callId}] Caller ${name} (${contact}) requested ${
+        requestedLabel ? `slot ${requestedLabel}` : "an appointment callback"
+      }.${note ? ` Notes: ${note}` : ""}`;
+      db.messages.push({
+        id: db.nextId("messages"),
+        thread_id: thread.id,
+        direction: "in",
+        text: summaryText,
+        provider_id: idempotencyKey,
+        status: "received",
+        created: nowSec(),
+      });
+
+      const { enquiry } = createManualEnquiry(
+        clinic,
+        {
+          name,
+          contact,
+          source: "phone",
+          service_interest: note || (requestedLabel ? `Voice request: ${requestedLabel}` : "Inbound AI voice call"),
+          note: summaryText,
+        },
+        "voice_ai",
+      );
+      enquiry.thread_id = thread.id;
+
+      takeover(
+        thread,
+        `Voice AI call request${requestedLabel ? ` (${requestedLabel})` : ""} — staff confirmation required`,
+        "voice_ai",
+      );
+
+      let holdExpires: number | null = null;
+      if (requestedStarts !== null) {
+        try {
+          const hold = createSlotHold(clinic, thread, requestedStarts, doctor?.id ?? null, service?.id ?? null);
+          holdExpires = hold.expires;
+        } catch {
+          holdExpires = null;
+        }
+      }
+
+      db.audit("voice_ai", "voice.request_created", callId, clinic.id);
+      await persistState();
+
+      res.status(201).json({
+        status: "pending_staff_confirmation",
+        duplicate: false,
+        call_id: callId,
+        thread_id: thread.id,
+        enquiry_id: enquiry.id,
+        slot_held: Boolean(holdExpires),
+        hold_expires: holdExpires,
+        message:
+          "Request logged in clinic inbox and enquiries for staff confirmation. Nothing is confirmed until reception approves.",
+      });
+      return;
+    }
+
+    throw new HttpError(422, "Unsupported action; use info, availability, or request");
+  }),
+);
+
+// Voice Call-Ended Metering Webhook (Vapi end-of-call-report, Bolna, Plivo, Retell)
+app.post(
+  "/api/voice/webhook",
+  wrap(async (req, res) => {
+    verifyVoiceBearer(req);
+    const normalized = normalizeVoiceWebhookPayload(req.body || {});
+    const clinic = db.clinics.find((c) => c.id === normalized.clinic_id);
+    if (!clinic) throw new HttpError(404, "Clinic not found");
+    const result = recordVoiceCall(clinic, normalized);
+    await persistState();
+    res.status(result.created ? 201 : 200).json(result);
+  }),
+);
+
+// Voice Minute Usage & Call Log Dashboard
+app.get(
+  "/api/voice/calls",
+  requireAuth,
+  wrap((req, res) => {
+    const clinicId = intParam(req.query.clinic_id, "clinic_id");
+    checkScope(req.principal!, clinicId);
+    const clinic = db.clinics.find((c) => c.id === clinicId);
+    if (!clinic) throw new HttpError(404, "Clinic not found");
+    const calls = db.voice_calls
+      .filter((c) => c.clinic_id === clinicId)
+      .sort((a, b) => b.created - a.created)
+      .slice(0, 100);
+    res.json({
+      usage: voiceUsageForMonth(clinic),
+      packs: VOICE_PACKS,
+      calls,
+    });
+  }),
+);
+
+app.put(
+  "/api/clinics/:clinicId/voice-pack",
+  requireAuth,
+  wrap(async (req, res) => {
+    const clinicId = intParam(req.params.clinicId, "clinic_id");
+    checkScope(req.principal!, clinicId);
+    ownerOrAdmin(req.principal!);
+    const clinic = db.clinics.find((c) => c.id === clinicId);
+    if (!clinic) throw new HttpError(404, "Clinic not found");
+    const b = req.body || {};
+    const packId = String(b.voice_pack || clinic.voice_pack || "none");
+    const spec = VOICE_PACKS.find((p) => p.id === packId);
+    if (!spec) {
+      throw new HttpError(422, "Invalid voice_pack; choose none, starter_100, growth_300, or pro_500");
+    }
+    clinic.voice_pack = spec.id;
+    clinic.voice_minutes_included =
+      b.voice_minutes_included !== undefined && req.principal!.role === "admin"
+        ? Math.max(0, Math.min(100000, Math.round(Number(b.voice_minutes_included))))
+        : spec.minutes;
+    if (b.voice_extra_rate !== undefined && req.principal!.role === "admin") {
+      clinic.voice_extra_rate = Math.max(0, Math.min(500, Number(b.voice_extra_rate)));
+    } else if (clinic.voice_extra_rate === undefined) {
+      clinic.voice_extra_rate = spec.extra_rate;
+    }
+    if (b.voice_cost_per_min !== undefined && req.principal!.role === "admin") {
+      clinic.voice_cost_per_min = Math.max(0, Math.min(500, Number(b.voice_cost_per_min)));
+    }
+    if (b.voice_alert_threshold_pct !== undefined) {
+      clinic.voice_alert_threshold_pct = Math.max(
+        50,
+        Math.min(99, Math.round(Number(b.voice_alert_threshold_pct))),
+      );
+    }
+    db.audit(req.principal!.username, "clinic.voice_pack_updated", `${spec.id} (${clinic.voice_minutes_included}m)`, clinicId);
+    await persistState();
+    res.json({
+      clinic: clinicDict(clinic),
+      usage: voiceUsageForMonth(clinic),
+    });
+  }),
+);
+
+// Demo-only simulated AI voice call for testing minute metering & transcripts
+app.post(
+  "/api/voice/simulate",
+  requireAuth,
+  wrap(async (req, res) => {
+    if (APP_MODE === "production") {
+      throw new HttpError(404, "Voice simulation is disabled in production");
+    }
+    ownerOrAdmin(req.principal!);
+    const b = req.body || {};
+    const clinicId = intParam(b.clinic_id, "clinic_id");
+    checkScope(req.principal!, clinicId);
+    const clinic = db.clinics.find((c) => c.id === clinicId);
+    if (!clinic) throw new HttpError(404, "Clinic not found");
+    const now = nowSec();
+    const duration = Math.max(15, Math.min(3600, Math.round(Number(b.duration_seconds) || 135)));
+    const direction = b.direction === "outbound" ? "outbound" : "inbound";
+    const outcome = ["booking_requested", "info_answered", "transferred", "missed", "voicemail", "reminder_confirmed"].includes(
+      String(b.outcome || ""),
+    )
+      ? String(b.outcome)
+      : direction === "outbound"
+        ? "reminder_confirmed"
+        : "booking_requested";
+    const callerName = String(b.caller_name || (direction === "outbound" ? "Meera Nair" : "Ravi Teja")).trim().slice(0, 120);
+    const contact = String(b.contact || "919848055443").replace(/\D/g, "").slice(0, 20);
+    const normalized = normalizeVoiceWebhookPayload({
+      clinic_id: clinic.id,
+      call_id: `sim-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      direction,
+      provider: "demo",
+      caller_name: callerName,
+      contact,
+      duration_seconds: duration,
+      outcome,
+      summary:
+        String(b.summary || "").trim() ||
+        (direction === "outbound"
+          ? `Outbound confirmation call to ${callerName} completed (${Math.ceil(duration / 60)} min billed).`
+          : `${callerName} called asking for consultation timing and requested a callback slot.`),
+      transcript:
+        String(b.transcript || "").trim() ||
+        `AI: Hello, thank you for calling ${clinic.name}! How can I help you today?\nCaller (${callerName}): Hi, I would like to book an appointment with ${clinic.doctor} this week.\nAI: Consultation fee is ₹${clinic.fee}. I have logged your request and our reception desk will confirm your slot shortly.`,
+      started_at: now - duration,
+      ended_at: now,
+    });
+    const result = recordVoiceCall(clinic, normalized);
+    await persistState();
+    res.status(201).json(result);
+  }),
+);
+
+// Public Embeddable Website Chat & Lead Widget API (unauthenticated, public-safe clinic facts only, rate-limited)
+function setWidgetCors(res: Response): void {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+function buildWhatsAppHandoffUrl(clinic: Clinic): string | null {
+  const digits = String(clinic.phone || "").replace(/\D/g, "");
+  if (digits.length < 8) return null;
+  const text = encodeURIComponent(`Hi ${clinic.name}, I visited your website and would like to book an appointment.`);
+  return `https://wa.me/${digits}?text=${text}`;
+}
+
+app.options(["/api/public/widget/:clinicId", "/api/public/widget/:clinicId/:action"], (_req, res) => {
+  setWidgetCors(res);
+  res.status(204).end();
+});
+
+app.get(
+  "/api/public/widget/:clinicId",
+  wrap((req, res) => {
+    setWidgetCors(res);
+    const ip = req.ip || "unknown";
+    db.checkRateLimit(`widget-info:${ip}`, 120, 300);
+    const clinicId = intParam(req.params.clinicId, "clinic_id");
+    const clinic = db.clinics.find((c) => c.id === clinicId);
+    if (!clinic || clinic.widget_enabled === false) {
+      throw new HttpError(404, "Widget is not available for this clinic");
+    }
+    const { services } = ensureCatalog(clinic);
+    res.json({
+      id: clinic.id,
+      name: clinic.name,
+      doctor: clinic.doctor,
+      address: clinic.address,
+      phone: clinic.phone,
+      fee: clinic.fee,
+      timezone: clinic.timezone,
+      booking_mode: clinic.booking_mode || "slots",
+      schedule: {
+        open: clinic.schedule.open,
+        close: clinic.schedule.close,
+        closed_days: clinic.schedule.closed_days || [],
+      },
+      services: services
+        .filter((s) => s.active)
+        .map((s) => ({ name: s.name, duration: s.duration, fee: s.fee })),
+      faqs: (clinic.faqs || []).slice(0, 12).map((f) => ({ question: f.question, answer: f.answer })),
+      widget_greeting:
+        clinic.widget_greeting ||
+        `Hi! Welcome to ${clinic.name}. Ask about fees, timings, or services—or book on WhatsApp.`,
+      whatsapp_url: buildWhatsAppHandoffUrl(clinic),
+    });
+  }),
+);
+
+app.post(
+  "/api/public/widget/:clinicId/ask",
+  wrap((req, res) => {
+    setWidgetCors(res);
+    const ip = req.ip || "unknown";
+    db.checkRateLimit(`widget-ask:${ip}`, 30, 300);
+    const clinicId = intParam(req.params.clinicId, "clinic_id");
+    const clinic = db.clinics.find((c) => c.id === clinicId);
+    if (!clinic || clinic.widget_enabled === false) {
+      throw new HttpError(404, "Widget is not available for this clinic");
+    }
+    const question = String(req.body?.question || "").trim();
+    if (!question || question.length > 400) {
+      throw new HttpError(422, "Enter a question between 1 and 400 characters");
+    }
+    ensureCatalog(clinic);
+    const result = answerPublicClinicQuestion(clinic, question);
+    res.json(result);
+  }),
+);
+
+app.post(
+  "/api/public/widget/:clinicId/lead",
+  wrap(async (req, res) => {
+    setWidgetCors(res);
+    const ip = req.ip || "unknown";
+    db.checkRateLimit(`widget-lead:${ip}`, 10, 300);
+    const clinicId = intParam(req.params.clinicId, "clinic_id");
+    const clinic = db.clinics.find((c) => c.id === clinicId);
+    if (!clinic || clinic.widget_enabled === false) {
+      throw new HttpError(404, "Widget is not available for this clinic");
+    }
+    const b = req.body || {};
+    const name = String(b.name || "").trim().slice(0, 120);
+    const contact = String(b.contact || "").replace(/\D/g, "").slice(0, 20);
+    const serviceInterest = String(b.service_interest || "").trim().slice(0, 300);
+    if (name.length < 2 || contact.length < 7) {
+      throw new HttpError(422, "Please enter your name and a valid phone number");
+    }
+    const { enquiry, created } = createManualEnquiry(
+      clinic,
+      {
+        name,
+        contact,
+        source: "website",
+        service_interest: serviceInterest || "Website chat callback request",
+        note: `Captured via embeddable website widget${serviceInterest ? `: ${serviceInterest}` : ""}`,
+      },
+      "website_widget",
+    );
+    db.audit("website_widget", created ? "enquiry.widget_created" : "enquiry.widget_reopened", enquiry.id, clinic.id);
+    await persistState();
+    res.status(created ? 201 : 200).json({
+      ok: true,
+      enquiry_id: enquiry.id,
+      created,
+      whatsapp_url: buildWhatsAppHandoffUrl(clinic),
+    });
+  }),
+);
+
+// Patient Reactivation & Recall Campaigns
+app.get(
+  "/api/recalls/candidates",
+  requireAuth,
+  wrap((req, res) => {
+    const clinicId = intParam(req.query.clinic_id, "clinic_id");
+    checkScope(req.principal!, clinicId);
+    const clinic = db.clinics.find((c) => c.id === clinicId);
+    if (!clinic) throw new HttpError(404, "Clinic not found");
+    const rawKind = String(req.query.kind || "six_month_checkup");
+    const kind = (rawKind in RECALL_TEMPLATES ? rawKind : "six_month_checkup") as keyof typeof RECALL_TEMPLATES;
+    const daysParam = req.query.days !== undefined && req.query.days !== "" ? Number(req.query.days) : null;
+    const candidates = findRecallCandidates(clinic, kind, daysParam);
+    res.json({
+      kind,
+      template: {
+        label: RECALL_TEMPLATES[kind].label,
+        template_name: RECALL_TEMPLATES[kind].template_name,
+        default_days: RECALL_TEMPLATES[kind].default_days,
+        preview: RECALL_TEMPLATES[kind].buildMessage(clinic, "{Patient}"),
+      },
+      templates: Object.entries(RECALL_TEMPLATES).map(([id, t]) => ({
+        id,
+        label: t.label,
+        template_name: t.template_name,
+        default_days: t.default_days,
+        preview: t.buildMessage(clinic, "{Patient}"),
+      })),
+      counts: {
+        total: candidates.length,
+        eligible: candidates.filter((c) => c.eligible).length,
+        opted_out: candidates.filter((c) => c.opted_out).length,
+        no_consent: candidates.filter((c) => !c.opted_out && !c.has_consent).length,
+      },
+      candidates,
+    });
+  }),
+);
+
+app.get(
+  "/api/recalls/campaigns",
+  requireAuth,
+  wrap((req, res) => {
+    const clinicId = intParam(req.query.clinic_id, "clinic_id");
+    checkScope(req.principal!, clinicId);
+    const campaigns = db.recall_campaigns
+      .filter((c) => c.clinic_id === clinicId)
+      .sort((a, b) => b.created - a.created)
+      .slice(0, 50);
+    res.json(campaigns);
+  }),
+);
+
+app.post(
+  "/api/recalls/campaigns",
+  requireAuth,
+  wrap(async (req, res) => {
+    ownerOrAdmin(req.principal!);
+    const b = req.body || {};
+    const clinicId = intParam(b.clinic_id, "clinic_id");
+    checkScope(req.principal!, clinicId);
+    const clinic = db.clinics.find((c) => c.id === clinicId);
+    if (!clinic) throw new HttpError(404, "Clinic not found");
+    const rawKind = String(b.kind || "six_month_checkup");
+    const kind = (rawKind in RECALL_TEMPLATES ? rawKind : "six_month_checkup") as keyof typeof RECALL_TEMPLATES;
+    const days = b.days !== undefined && b.days !== "" && b.days !== null ? Number(b.days) : null;
+    const result = launchRecallCampaign(clinic, {
+      kind,
+      name: b.name ? String(b.name) : undefined,
+      template_name: b.template_name ? String(b.template_name) : undefined,
+      custom_message: b.custom_message ? String(b.custom_message) : undefined,
+      days,
+      contacts: Array.isArray(b.contacts) ? b.contacts.map(String) : undefined,
+      actor: req.principal!.username,
+    });
+    await persistState();
+    void runWorkerTick();
+    res.status(201).json(result);
+  }),
+);
+
+// Token / Queue-Number Mode (Morning / Evening Sessions + Live Token #)
+app.get(
+  "/api/queue",
+  requireAuth,
+  wrap((req, res) => {
+    const clinicId = intParam(req.query.clinic_id, "clinic_id");
+    checkScope(req.principal!, clinicId);
+    const clinic = db.clinics.find((c) => c.id === clinicId);
+    if (!clinic) throw new HttpError(404, "Clinic not found");
+    const date = req.query.date ? String(req.query.date) : null;
+    res.json(getQueueBoard(clinic, date));
+  }),
+);
+
+app.post(
+  "/api/queue/tokens",
+  requireAuth,
+  wrap(async (req, res) => {
+    const b = req.body || {};
+    const clinicId = intParam(b.clinic_id, "clinic_id");
+    checkScope(req.principal!, clinicId);
+    const clinic = db.clinics.find((c) => c.id === clinicId);
+    if (!clinic) throw new HttpError(404, "Clinic not found");
+    const source = ["walk_in", "phone", "whatsapp", "demo"].includes(String(b.source))
+      ? (String(b.source) as "walk_in" | "phone" | "whatsapp" | "demo")
+      : "walk_in";
+    const issued = issueQueueToken(clinic, {
+      date: b.date ? String(b.date) : null,
+      session_id: String(b.session_id || "morning"),
+      patient_name: String(b.patient_name || ""),
+      contact: b.contact ? String(b.contact) : "",
+      source,
+      notes: b.notes ? String(b.notes) : "",
+      actor: req.principal!.username,
+    });
+    await persistState();
+    res.status(201).json(issued);
+  }),
+);
+
+app.patch(
+  "/api/queue/tokens/:tokenId",
+  requireAuth,
+  wrap(async (req, res) => {
+    const tokenId = intParam(req.params.tokenId, "token_id");
+    const token = db.queue_tokens.find((t) => t.id === tokenId);
+    if (!token) throw new HttpError(404, "Token not found");
+    checkScope(req.principal!, token.clinic_id);
+    const status = String(req.body?.status || "");
+    if (!["waiting", "serving", "completed", "skipped", "cancelled"].includes(status)) {
+      throw new HttpError(422, "Invalid token status");
+    }
+    const now = nowSec();
+    if (status === "serving") {
+      for (const other of db.queue_tokens) {
+        if (
+          other.clinic_id === token.clinic_id &&
+          other.date === token.date &&
+          other.session_id === token.session_id &&
+          other.status === "serving" &&
+          other.id !== token.id
+        ) {
+          other.status = "completed";
+          other.completed_at = now;
+        }
+      }
+      token.called_at = now;
+    } else if (status === "completed") {
+      token.completed_at = now;
+    }
+    token.status = status as typeof token.status;
+    db.audit(req.principal!.username, `queue.token_${status}`, `${token.date} ${token.session_id} #${token.token_number}`, token.clinic_id);
+    await persistState();
+    res.json(token);
+  }),
+);
+
+app.post(
+  "/api/queue/next",
+  requireAuth,
+  wrap(async (req, res) => {
+    const b = req.body || {};
+    const clinicId = intParam(b.clinic_id, "clinic_id");
+    checkScope(req.principal!, clinicId);
+    const clinic = db.clinics.find((c) => c.id === clinicId);
+    if (!clinic) throw new HttpError(404, "Clinic not found");
+    const sessionId = String(b.session_id || "morning");
+    const date = b.date ? String(b.date) : null;
+    const result = advanceQueueSession(clinic, date, sessionId, req.principal!.username);
+    await persistState();
+    res.json({
+      ...result,
+      board: getQueueBoard(clinic, date),
+    });
+  }),
+);
+
+app.put(
+  "/api/clinics/:clinicId/queue-settings",
+  requireAuth,
+  wrap(async (req, res) => {
+    ownerOrAdmin(req.principal!);
+    const clinicId = intParam(req.params.clinicId, "clinic_id");
+    checkScope(req.principal!, clinicId);
+    const clinic = db.clinics.find((c) => c.id === clinicId);
+    if (!clinic) throw new HttpError(404, "Clinic not found");
+    const b = req.body || {};
+    const mode = String(b.booking_mode || clinic.booking_mode || "slots");
+    if (!["slots", "tokens", "hybrid"].includes(mode)) {
+      throw new HttpError(422, "booking_mode must be slots, tokens, or hybrid");
+    }
+    clinic.booking_mode = mode as Clinic["booking_mode"];
+    if (Array.isArray(b.token_sessions) && b.token_sessions.length > 0) {
+      const cleaned: TokenSessionConfig[] = [];
+      for (const raw of b.token_sessions.slice(0, 6)) {
+        const id = String(raw?.id || "")
+          .trim()
+          .toLowerCase()
+          .replace(/[^a-z0-9_-]/g, "")
+          .slice(0, 32);
+        const label = String(raw?.label || "").trim().slice(0, 60);
+        const start = String(raw?.start || "09:30").trim();
+        const end = String(raw?.end || "13:00").trim();
+        const maxTokens = Math.max(1, Math.min(500, Math.round(Number(raw?.max_tokens) || 30)));
+        const avgMinutes = Math.max(1, Math.min(120, Math.round(Number(raw?.avg_minutes) || 10)));
+        if (!id || !label || !/^\d{2}:\d{2}$/.test(start) || !/^\d{2}:\d{2}$/.test(end)) {
+          throw new HttpError(422, "Each queue session needs a valid id, label, and HH:MM start/end time");
+        }
+        cleaned.push({ id, label, start, end, max_tokens: maxTokens, avg_minutes: avgMinutes });
+      }
+      clinic.token_sessions = cleaned;
+    }
+    db.audit(req.principal!.username, "clinic.queue_settings_updated", clinic.booking_mode, clinicId);
+    await persistState();
+    res.json({
+      clinic: clinicDict(clinic),
+      board: getQueueBoard(clinic),
+    });
   }),
 );
 

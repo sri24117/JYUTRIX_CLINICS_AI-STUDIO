@@ -4,6 +4,7 @@ import {
   Doctor,
   HttpError,
   Service,
+  SlotHold,
   Thread,
   db,
   ensureCatalog,
@@ -11,6 +12,8 @@ import {
   nowSec,
 } from "./store.js";
 import { recordBooking } from "./enquiries.js";
+
+export const SLOT_HOLD_SECONDS = 5 * 60;
 
 export interface LocalParts {
   year: number;
@@ -175,12 +178,87 @@ function hhmmToMins(x: string): number {
   return h * 60 + m;
 }
 
+export function pruneExpiredHolds(): void {
+  const now = nowSec();
+  if (db.holds.some((h) => h.expires <= now)) {
+    db.holds = db.holds.filter((h) => h.expires > now);
+  }
+}
+
+export function releaseThreadHolds(threadId: number): void {
+  db.holds = db.holds.filter((h) => h.thread_id !== threadId);
+}
+
+export function isInWalkinWindow(
+  clinic: Clinic,
+  doctor: Doctor,
+  starts: number,
+  durationMinutes: number,
+): { matched: boolean; window?: { start: string; end: string } } {
+  const windows =
+    (doctor.schedule.walkin_windows && doctor.schedule.walkin_windows.length
+      ? doctor.schedule.walkin_windows
+      : clinic.schedule.walkin_windows) || [];
+  if (!windows.length) return { matched: false };
+  const dt = localParts(clinic.timezone, starts);
+  const mins = dt.hour * 60 + dt.minute;
+  for (const w of windows) {
+    if (w.start && w.end && mins < hhmmToMins(w.end) && mins + durationMinutes > hhmmToMins(w.start)) {
+      return { matched: true, window: w };
+    }
+  }
+  return { matched: false };
+}
+
+export function createSlotHold(
+  clinic: Clinic,
+  thread: Thread,
+  starts: number,
+  doctorId: number | null,
+  serviceId: number | null,
+): SlotHold {
+  pruneExpiredHolds();
+  releaseThreadHolds(thread.id);
+  const doctor = doctorId ? db.doctors.find((d) => d.id === doctorId) || null : defaultDoctor(clinic);
+  const service = serviceId ? db.services.find((s) => s.id === serviceId) || null : defaultService(clinic);
+  if (!doctor || !service) {
+    throw new HttpError(409, "Clinic needs an active doctor and service");
+  }
+  const ends = checkSlot(clinic, starts, {
+    demo: thread.channel === "demo",
+    doctorId: doctor.id,
+    serviceId: service.id,
+    holdThreadId: thread.id,
+  });
+  const now = nowSec();
+  const hold: SlotHold = {
+    id: db.nextId("holds"),
+    clinic_id: clinic.id,
+    doctor_id: doctor.id,
+    thread_id: thread.id,
+    starts,
+    ends,
+    demo: thread.channel === "demo",
+    expires: now + SLOT_HOLD_SECONDS,
+    created: now,
+  };
+  db.holds.push(hold);
+  return hold;
+}
+
 export function checkSlot(
   clinic: Clinic,
   starts: number,
-  options: { exclude?: number | null; demo?: boolean; doctorId?: number | null; serviceId?: number | null } = {},
+  options: {
+    exclude?: number | null;
+    demo?: boolean;
+    doctorId?: number | null;
+    serviceId?: number | null;
+    holdThreadId?: number | null;
+  } = {},
 ): number {
-  const { exclude = null, demo = false, doctorId = null, serviceId = null } = options;
+  const { exclude = null, demo = false, doctorId = null, serviceId = null, holdThreadId = null } = options;
+  pruneExpiredHolds();
   if (starts <= nowSec()) {
     throw new HttpError(409, "Choose a future appointment");
   }
@@ -242,6 +320,22 @@ export function checkSlot(
   if (conflict) {
     throw new HttpError(409, "Slot just filled. Choose another time.");
   }
+
+  const now = nowSec();
+  const activeHold = db.holds.find(
+    (h) =>
+      h.clinic_id === clinic.id &&
+      h.doctor_id === doctor.id &&
+      h.demo === demo &&
+      h.expires > now &&
+      h.starts < ends &&
+      h.ends > starts &&
+      (holdThreadId == null || h.thread_id !== holdThreadId),
+  );
+  if (activeHold) {
+    throw new HttpError(409, "Slot is currently being held by another patient confirming on WhatsApp.");
+  }
+
   return ends;
 }
 
@@ -299,6 +393,137 @@ export function available(
     }
   }
   return result;
+}
+
+export interface TimelineSlot {
+  starts: number;
+  ends: number;
+  iso: string;
+  time_label: string;
+  label: string;
+  status: "available" | "held" | "blocked" | "booked" | "past" | "break";
+  walkin_priority: boolean;
+  doctor_id: number;
+  doctor: string;
+  service_id: number;
+  service: string;
+  appointment_id?: number;
+  patient_name?: string;
+  source?: string;
+  hold_expires?: number;
+}
+
+export function dayTimeline(
+  clinic: Clinic,
+  options: { targetDate?: string | null; doctorId?: number | null; serviceId?: number | null } = {},
+): { date: string; closed: boolean; doctor_id: number; doctor: string; service_id: number; slots: TimelineSlot[] } {
+  pruneExpiredHolds();
+  const { doctors, services } = ensureCatalog(clinic);
+  const doctor = options.doctorId
+    ? db.doctors.find((d) => d.id === options.doctorId && d.clinic_id === clinic.id) || null
+    : doctors.find((d) => d.active) || null;
+  const service = options.serviceId
+    ? db.services.find((s) => s.id === options.serviceId && s.clinic_id === clinic.id) || null
+    : services.find((s) => s.active) || null;
+  if (!doctor || !service) {
+    throw new HttpError(422, "Clinic needs an active doctor and service");
+  }
+
+  const now = nowSec();
+  const today = localParts(clinic.timezone, now).dateStr;
+  const dateStr = options.targetDate ? parseDateStr(options.targetDate).iso : today;
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const schedule = doctor.schedule;
+  const midday = zonedToEpoch(clinic.timezone, y, m, d, 12, 0, 0);
+  const weekday = localParts(clinic.timezone, midday).weekday;
+  const closed =
+    (schedule.closed_days || []).includes(weekday) || (schedule.leave_dates || []).includes(dateStr);
+
+  if (closed) {
+    return { date: dateStr, closed: true, doctor_id: doctor.id, doctor: doctor.name, service_id: service.id, slots: [] };
+  }
+
+  const opening = hhmmToMins(schedule.open);
+  const closing = hhmmToMins(schedule.close);
+  const duration = service.duration;
+  const slots: TimelineSlot[] = [];
+
+  for (let mins = opening; mins + duration <= closing; mins += duration) {
+    const starts = zonedToEpoch(clinic.timezone, y, m, d, Math.floor(mins / 60), mins % 60, 0);
+    const ends = starts + duration * 60;
+    const h24 = Math.floor(mins / 60);
+    const mm = mins % 60;
+    const h12 = h24 % 12 || 12;
+    const period = h24 >= 12 ? "PM" : "AM";
+    const timeLabel = `${String(h12).padStart(2, "0")}:${String(mm).padStart(2, "0")} ${period}`;
+
+    let isBreak = false;
+    for (const gap of schedule.breaks || []) {
+      if (gap.start && gap.end && mins < hhmmToMins(gap.end) && mins + duration > hhmmToMins(gap.start)) {
+        isBreak = true;
+        break;
+      }
+    }
+
+    const walkinPriority = isInWalkinWindow(clinic, doctor, starts, duration).matched;
+    const appt = db.appointments.find(
+      (a) =>
+        a.clinic_id === clinic.id &&
+        a.doctor_id === doctor.id &&
+        a.status === "confirmed" &&
+        a.source !== "demo" &&
+        a.starts < ends &&
+        a.ends > starts,
+    );
+    const hold = db.holds.find(
+      (h) =>
+        h.clinic_id === clinic.id &&
+        h.doctor_id === doctor.id &&
+        !h.demo &&
+        h.expires > now &&
+        h.starts < ends &&
+        h.ends > starts,
+    );
+
+    let status: TimelineSlot["status"] = "available";
+    if (isBreak) {
+      status = "break";
+    } else if (appt) {
+      const isQuickBlock = appt.request_key.startsWith("quick-block:") || appt.request_key.startsWith("staff-wa:");
+      status = isQuickBlock ? "blocked" : "booked";
+    } else if (hold) {
+      status = "held";
+    } else if (starts <= now) {
+      status = "past";
+    }
+
+    slots.push({
+      starts,
+      ends,
+      iso: toLocalIso(clinic, starts),
+      time_label: timeLabel,
+      label: readable(clinic, starts),
+      status,
+      walkin_priority: walkinPriority,
+      doctor_id: doctor.id,
+      doctor: doctor.name,
+      service_id: service.id,
+      service: service.name,
+      appointment_id: appt?.id,
+      patient_name: appt?.name,
+      source: appt?.source,
+      hold_expires: hold?.expires,
+    });
+  }
+
+  return {
+    date: dateStr,
+    closed: false,
+    doctor_id: doctor.id,
+    doctor: doctor.name,
+    service_id: service.id,
+    slots,
+  };
 }
 
 export function reminderJobs(clinic: Clinic, appt: Appointment, thread: Thread | null): void {
@@ -376,6 +601,7 @@ export function book(
     demo: source === "demo",
     doctorId: doctor.id,
     serviceId: service.id,
+    holdThreadId: thread ? thread.id : null,
   });
 
   const appt: Appointment = {
@@ -399,6 +625,7 @@ export function book(
     created: nowSec(),
   };
   db.appointments.push(appt);
+  if (thread) releaseThreadHolds(thread.id);
   reminderJobs(clinic, appt, thread);
   db.audit(source, "appointment.created", appt.id, clinic.id);
   recordBooking(clinic, appt, thread);

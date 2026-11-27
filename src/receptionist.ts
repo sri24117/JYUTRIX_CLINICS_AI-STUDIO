@@ -1,7 +1,9 @@
 import {
+  Appointment,
   Clinic,
   Doctor,
   HttpError,
+  ReviewRecord,
   Service,
   Thread,
   WaitlistEntry,
@@ -11,22 +13,31 @@ import {
   nowSec,
 } from "./store.js";
 import {
+  SLOT_HOLD_SECONDS,
   addDaysDateStr,
   available,
   book,
   cancelReminders,
   checkSlot,
+  createSlotHold,
+  defaultDoctor,
+  defaultService,
+  isInWalkinWindow,
   localParts,
   parseDateStr,
   readable,
+  releaseThreadHolds,
   reschedule,
+  zonedToEpoch,
 } from "./booking.js";
 import { onOptOut, trackWhatsApp } from "./enquiries.js";
 import { verifyReminderActionToken } from "./kapso.js";
+import { getQueueBoard, issueQueueToken } from "./queue.js";
 
 const MEDICAL =
   /\b(medicine|medication|dosage|diagnos|prescrib|antibiotic|chest pain|bleeding|breath|emergency|suicide|overdose|severe pain|swelling|guarantee|treatment success|pain|symptom|cure|fever)\w*|రక్త|శ్వాస|अत्यधिक|सांस/i;
 const BOOKING = /\b(book|booking|appointment|slot|visit|appt|kavali)\b|అపాయింట్|బుక్|अपॉइंट|बुक/i;
+const TOKEN_CMD = /\b(token|queue|line|waiting number)\b|టోకెన్|टोकन/i;
 const HUMAN = /\b(human|staff|receptionist|complaint|agent|person|help me)\b|సిబ్బంది|मनुष्य|स्टाफ/i;
 
 const OFFER_SECONDS = 20 * 60;
@@ -105,6 +116,7 @@ export function takeover(thread: Thread, reason: string, actor = "system"): void
   thread.attention = reason;
   thread.state = {};
   thread.generation += 1;
+  releaseThreadHolds(thread.id);
   for (const job of db.jobs) {
     if (
       job.thread_id === thread.id &&
@@ -120,6 +132,53 @@ export function takeover(thread: Thread, reason: string, actor = "system"): void
     }
   }
   db.audit(actor, "conversation.takeover", thread.id, thread.clinic_id);
+}
+
+export function triggerPostVisitReview(clinic: Clinic, appt: Appointment): ReviewRecord | null {
+  if (clinic.review_requests_enabled === false) return null;
+  const existing = db.reviews.find(
+    (r) => r.clinic_id === clinic.id && r.appointment_id === appt.id,
+  );
+  if (existing) return existing;
+
+  const thread = appt.thread_id
+    ? db.threads.find((t) => t.id === appt.thread_id && t.clinic_id === clinic.id) || null
+    : db.threads.find(
+        (t) =>
+          t.clinic_id === clinic.id &&
+          t.contact === appt.contact &&
+          (appt.source === "demo" ? t.channel === "demo" : t.channel === "whatsapp"),
+      ) || null;
+
+  if (!thread || thread.opted_out) return null;
+  if (thread.channel === "whatsapp" && !(appt.consent || thread.consent)) return null;
+
+  const now = nowSec();
+  const rec: ReviewRecord = {
+    id: db.nextId("reviews"),
+    clinic_id: clinic.id,
+    appointment_id: appt.id,
+    thread_id: thread.id,
+    patient_name: appt.name,
+    contact: appt.contact,
+    rating: null,
+    status: "requested",
+    feedback_note: "",
+    created: now,
+    responded_at: null,
+  };
+  db.reviews.push(rec);
+  thread.state = {
+    step: "review_rating",
+    review_id: rec.id,
+    appointment_id: appt.id,
+    expires: now + 86400,
+  };
+  thread.updated = now;
+  const msg = `Thank you for visiting ${clinic.name}! How was your visit today? Reply with a number from 1 to 5 (5 = excellent).`;
+  queueReply(clinic, thread, msg, `review-ask:${clinic.id}:${appt.id}`, "bot");
+  db.audit("system", "review.requested", rec.id, clinic.id);
+  return rec;
 }
 
 export function joinWaitlist(clinic: Clinic, thread: Thread): WaitlistEntry | null {
@@ -319,6 +378,119 @@ function approvedFaq(clinic: Clinic, text: string): string | null {
   return bestAnswer;
 }
 
+export function answerPublicClinicQuestion(
+  clinic: Clinic,
+  text: string,
+): { reply: string; matched: string; medical_disclaimer: boolean } {
+  const t = String(text || "").trim().slice(0, 400);
+  const lower = t.toLowerCase();
+  if (!t) {
+    return {
+      reply:
+        clinic.widget_greeting ||
+        `Hello! Welcome to ${clinic.name}. Ask about fees, timings, address, or services—or leave your number for a callback.`,
+      matched: "greeting",
+      medical_disclaimer: false,
+    };
+  }
+  if (MEDICAL.test(t)) {
+    return {
+      reply: `I am an automated clinic assistant and cannot give medical advice or diagnose symptoms. For an emergency, please seek immediate medical care. To speak with our clinic team, call ${clinic.phone}.`,
+      matched: "medical_refusal",
+      medical_disclaimer: true,
+    };
+  }
+  if (/fee|cost|price|charge|entha|ఫీజు|ధర|शुल्क|कीमत/i.test(lower)) {
+    const activeSvcs = db.services.filter((s) => s.clinic_id === clinic.id && s.active);
+    const svcSummary = activeSvcs.length
+      ? ` Active services: ${activeSvcs.slice(0, 5).map((s) => `${s.name} (Rs ${s.fee})`).join(", ")}.`
+      : "";
+    return {
+      reply: `Consultation fee at ${clinic.name} is Rs ${clinic.fee}.${svcSummary} Final treatment estimates are confirmed by ${clinic.doctor} in person.`,
+      matched: "fee",
+      medical_disclaimer: false,
+    };
+  }
+  if (/address|location|where|map|direction|ekkada|చిరునామా|ఎక్కడ|पता|कहाँ/i.test(lower)) {
+    return {
+      reply: `${clinic.name} is located at ${clinic.address}. Clinic phone: ${clinic.phone}.`,
+      matched: "address",
+      medical_disclaimer: false,
+    };
+  }
+  if (/timing|hours|open|close|when|eppudu|సమయం|समय/i.test(lower)) {
+    const s = clinic.schedule;
+    const days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const closedText = (s.closed_days || []).map((d) => days[d]).join(", ") || "none";
+    return {
+      reply: `${clinic.name} hours: ${s.open}–${s.close} (${clinic.timezone}). Closed: ${closedText}.`,
+      matched: "hours",
+      medical_disclaimer: false,
+    };
+  }
+  if (/service|treatment|procedure|offer|సేవ|सेवा/i.test(lower)) {
+    const activeSvcs = db.services.filter((s) => s.clinic_id === clinic.id && s.active);
+    const list = activeSvcs.length
+      ? activeSvcs.map((s) => `${s.name} (Rs ${s.fee})`).join(", ")
+      : (clinic.services || []).join(", ");
+    return {
+      reply: `Approved services at ${clinic.name}: ${list || "General consultation"}.`,
+      matched: "services",
+      medical_disclaimer: false,
+    };
+  }
+  if (/^(hi|hello|hey|namaste|నమస్కారం|నమస్తే|नमस्ते)\b/i.test(lower)) {
+    return {
+      reply:
+        clinic.widget_greeting ||
+        `Hello! I am ${clinic.name}’s assistant. Ask about consultation fees, clinic timings, address, or services—or book directly on WhatsApp.`,
+      matched: "greeting",
+      medical_disclaimer: false,
+    };
+  }
+  const faq = approvedFaq(clinic, t);
+  if (faq) {
+    return {
+      reply: faq,
+      matched: "faq",
+      medical_disclaimer: false,
+    };
+  }
+  if (BOOKING.test(t) || TOKEN_CMD.test(t)) {
+    return {
+      reply: `You can book an appointment with ${clinic.doctor} right away using WhatsApp below, or leave your phone number in the callback form and reception will confirm your slot.`,
+      matched: "booking_handoff",
+      medical_disclaimer: false,
+    };
+  }
+  return {
+    reply: `I can answer approved questions about ${clinic.name}’s fees, timings, address, and services. For anything else, leave your number in the callback form below or call ${clinic.phone}.`,
+    matched: "fallback",
+    medical_disclaimer: false,
+  };
+}
+
+function offerTokenSessions(clinic: Clinic, thread: Thread): string {
+  const board = getQueueBoard(clinic);
+  const openSessions = board.sessions.filter((s) => s.remaining_capacity > 0);
+  if (!openSessions.length) {
+    return `All token sessions for ${board.date} are currently full. Please reply STAFF or call ${clinic.phone}.`;
+  }
+  thread.state = {
+    step: "choose_token_session",
+    session_ids: openSessions.map((s) => s.id),
+    date: board.date,
+    expires: nowSec() + 900,
+  };
+  const lines = openSessions
+    .map(
+      (s, idx) =>
+        `${idx + 1}. ${s.label} (${s.start}–${s.end}) · Next Token #${s.next_token} · Est. wait ~${s.estimated_wait_minutes} mins`,
+    )
+    .join("\n");
+  return `Live queue tokens for ${clinic.name} (${board.date}):\n${lines}\nReply with a session number (e.g. 1) to get your token.`;
+}
+
 function offer(clinic: Clinic, thread: Thread, text: string, appointmentId: number | null = null): string {
   let target: string;
   try {
@@ -404,8 +576,159 @@ function offer(clinic: Clinic, thread: Thread, text: string, appointmentId: numb
     expires: nowSec() + 900,
     appointment_id: appointmentId,
   };
-  const choices = slots.map((s, i) => `${i + 1}. ${readable(clinic, s)}`).join("\n");
+  const choices = slots
+    .map((s, i) => {
+      const peak = isInWalkinWindow(clinic, selectedDoctor!, s, selectedService!.duration).matched;
+      return `${i + 1}. ${readable(clinic, s)}${peak ? " (request only)" : ""}`;
+    })
+    .join("\n");
   return `Available with ${selectedDoctor.name} for ${selectedService.name} (${clinic.timezone}):\n${choices}\nReply 1, 2 or 3 to choose. Nothing is booked yet. Or send another date as YYYY-MM-DD.`;
+}
+
+function digitsOnly(v: string): string {
+  return String(v || "").replace(/\D/g, "");
+}
+
+export function isAuthorizedStaffContact(clinic: Clinic, contact: string): boolean {
+  const cDigits = digitsOnly(contact);
+  if (!cDigits || !(clinic.staff_phones || []).length) return false;
+  return (clinic.staff_phones || []).some((sp) => {
+    const sDigits = digitsOnly(sp);
+    if (!sDigits) return false;
+    return sDigits === cDigits || (sDigits.length >= 10 && cDigits.endsWith(sDigits.slice(-10)));
+  });
+}
+
+function parseStaffTime(
+  clinic: Clinic,
+  doctor: Doctor,
+  dateToken: string | null,
+  timeToken: string,
+): { starts: number; dateStr: string } {
+  const today = localParts(clinic.timezone, nowSec()).dateStr;
+  let dateStr = today;
+  if (dateToken) {
+    if (/^tomorrow$/i.test(dateToken)) {
+      dateStr = addDaysDateStr(today, 1);
+    } else {
+      dateStr = parseDateStr(dateToken).iso;
+    }
+  }
+  const m = timeToken.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i);
+  if (!m) {
+    throw new HttpError(422, "Use a time like 10:30, 4:30pm, or 16:30");
+  }
+  let hour = Number(m[1]);
+  const minute = Number(m[2] ?? "0");
+  const meridiem = m[3]?.toLowerCase() || "";
+  if (minute < 0 || minute > 59 || hour < 0 || hour > 23) {
+    throw new HttpError(422, "Invalid time");
+  }
+  if (meridiem === "pm" && hour < 12) hour += 12;
+  else if (meridiem === "am" && hour === 12) hour = 0;
+  else if (!meridiem && hour >= 1 && hour <= 11) {
+    // Disambiguate 12h clock using clinic opening/closing hours (e.g. "4:30" -> 16:30 when open 09:00-19:00)
+    const [openH, openM] = doctor.schedule.open.split(":").map(Number);
+    const [closeH, closeM] = doctor.schedule.close.split(":").map(Number);
+    const openMin = openH * 60 + openM;
+    const closeMin = closeH * 60 + closeM;
+    const rawMin = hour * 60 + minute;
+    const pmMin = (hour + 12) * 60 + minute;
+    if (rawMin < openMin && pmMin >= openMin && pmMin < closeMin) {
+      hour += 12;
+    }
+  }
+  const [y, mo, d] = dateStr.split("-").map(Number);
+  return { starts: zonedToEpoch(clinic.timezone, y, mo, d, hour, minute, 0), dateStr };
+}
+
+export function tryStaffCommand(
+  clinic: Clinic,
+  contact: string,
+  text: string,
+  eventKey: string,
+): string | null {
+  if (!isAuthorizedStaffContact(clinic, contact)) return null;
+  const trimmed = text.trim();
+  const cmdMatch = trimmed.match(/^(block|walkin|walk-in|call|unblock|free|slots|today)\b(.*)$/i);
+  if (!cmdMatch) return null;
+
+  const cmd = cmdMatch[1].toLowerCase();
+  const rest = cmdMatch[2].trim();
+  const doctor = defaultDoctor(clinic);
+  const service = defaultService(clinic);
+  if (!doctor || !service) {
+    return "Clinic needs an active doctor and service configured first.";
+  }
+
+  if (cmd === "slots" || cmd === "today") {
+    const target = rest && /^\d{4}-\d{2}-\d{2}$/.test(rest) ? rest : localParts(clinic.timezone, nowSec()).dateStr;
+    const free = available(clinic, { targetDate: target, count: 8, doctorId: doctor.id, serviceId: service.id });
+    if (!free.length) return `No open slots left on ${target} for ${doctor.name}.`;
+    return `Open slots (${doctor.name}, ${target}):\n${free.map((s) => "• " + readable(clinic, s)).join("\n")}`;
+  }
+
+  // Parse optional date ("2026-11-24" or "tomorrow") + time ("11:00", "4:30pm") + optional patient label
+  const argsMatch = rest.match(
+    /^(?:(\d{4}-\d{2}-\d{2}|tomorrow)\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)(?:\s+(.*))?$/i,
+  );
+  if (!argsMatch) {
+    return "Usage: BLOCK 11:00 [Patient name], WALKIN 4:30 [Name], UNBLOCK 11:00, or SLOTS.";
+  }
+
+  let parsed: { starts: number; dateStr: string };
+  try {
+    parsed = parseStaffTime(clinic, doctor, argsMatch[1] || null, argsMatch[2]);
+  } catch (e: any) {
+    return e.detail || "Could not parse time. Example: BLOCK 11:00 Ramesh";
+  }
+
+  if (cmd === "unblock" || cmd === "free") {
+    const appt = db.appointments.find(
+      (a) =>
+        a.clinic_id === clinic.id &&
+        a.doctor_id === doctor.id &&
+        a.status === "confirmed" &&
+        a.source !== "demo" &&
+        a.starts === parsed.starts,
+    );
+    if (!appt) {
+      return `No active booking or block found at ${readable(clinic, parsed.starts)}.`;
+    }
+    appt.status = "cancelled";
+    cancelReminders(appt);
+    offerWaitlistForSlot(clinic, appt.starts, appt.doctor_id, appt.service_id, false);
+    db.audit("staff_whatsapp", "appointment.unblocked", appt.id, clinic.id);
+    return `✓ Released ${readable(clinic, parsed.starts)} (${appt.name}). Slot is open for WhatsApp again.`;
+  }
+
+  const labelRaw = (argsMatch[3] || "").trim().slice(0, 100);
+  const tag = cmd === "walkin" || cmd === "walk-in" ? "Walk-in" : cmd === "call" ? "Phone call" : "Desk block";
+  const displayName = labelRaw ? `${labelRaw} (${tag})` : `${tag} — quick block`;
+
+  try {
+    const appt = book(clinic, null, parsed.starts, `staff-wa:${clinic.id}:${eventKey}`, {
+      source: "staff",
+      name: displayName,
+      contact: digitsOnly(contact),
+      consent: false,
+      doctorId: doctor.id,
+      serviceId: service.id,
+    });
+    db.audit("staff_whatsapp", "appointment.quick_blocked", appt.id, clinic.id);
+    return `✓ Blocked ${readable(clinic, appt.starts)} (${displayName}). Removed from WhatsApp availability.`;
+  } catch (e: any) {
+    const nextSlots = available(clinic, {
+      targetDate: parsed.dateStr,
+      count: 3,
+      doctorId: doctor.id,
+      serviceId: service.id,
+    });
+    const nextText = nextSlots.length
+      ? ` Next open: ${nextSlots.map((s) => readable(clinic, s)).join(", ")}.`
+      : "";
+    return `✕ Could not block ${readable(clinic, parsed.starts)}: ${e.detail || "Slot unavailable."}${nextText}`;
+  }
 }
 
 function handleReminderAction(clinic: Clinic, thread: Thread, token: string): string {
@@ -478,6 +801,7 @@ function reception(
     thread.consent = false;
     thread.state = {};
     thread.generation += 1;
+    releaseThreadHolds(thread.id);
     let released: [number, number | null, number | null] | null = null;
     for (const entry of db.waitlist) {
       if (entry.thread_id === thread.id && ["waiting", "offered"].includes(entry.status)) {
@@ -541,8 +865,42 @@ function reception(
 
   let state = thread.state || {};
   if (Object.keys(state).length && (state.expires || 0) < nowSec()) {
+    releaseThreadHolds(thread.id);
     thread.state = {};
     state = {};
+  }
+
+  if (state.step === "review_rating") {
+    const ratingMatch = t.match(/^\s*([1-5])(?:\s*\/\s*5|\s*stars?)?(?:\s*[-:,.]?\s*(.*))?$/i);
+    if (ratingMatch) {
+      const rating = Number(ratingMatch[1]);
+      const note = (ratingMatch[2] || "").trim().slice(0, 500);
+      const rec = db.reviews.find((r) => r.id === state.review_id && r.clinic_id === clinic.id);
+      if (rec) {
+        rec.rating = rating;
+        rec.responded_at = nowSec();
+        if (note) rec.feedback_note = note;
+      }
+      if (rating >= 4) {
+        if (rec) rec.status = "happy_link_sent";
+        thread.state = {};
+        db.audit("patient", "review.positive", rec?.id ?? thread.id, clinic.id);
+        const safeUrl =
+          clinic.google_review_url && /^https?:\/\//i.test(clinic.google_review_url.trim())
+            ? clinic.google_review_url.trim()
+            : "";
+        return safeUrl
+          ? `Thank you for the ${rating}/5 rating! If you have 30 seconds, a quick Google review helps local patients find ${clinic.name}: ${safeUrl}`
+          : `Thank you so much for the ${rating}/5 rating! We look forward to caring for you at ${clinic.name}.`;
+      }
+      if (rec) {
+        rec.status = "escalated";
+        if (!rec.feedback_note) rec.feedback_note = t.slice(0, 500);
+      }
+      db.audit("patient", "review.escalated", rec?.id ?? thread.id, clinic.id);
+      takeover(thread, `Low visit rating (${rating}/5) — private recovery needed`, "system");
+      return `Thank you for your honest feedback (${rating}/5). We are sorry your visit was not 5-star—our clinic manager has been notified privately and will reach out to make it right. You can also reply here with details.`;
+    }
   }
 
   if (state.step === "waitlist_offer") {
@@ -615,6 +973,7 @@ function reception(
         db.audit("patient", "appointment.cancellation_declined", appt.id, clinic.id);
       }
     }
+    releaseThreadHolds(thread.id);
     thread.state = {};
     return "No change made. Reply BOOK to see availability or STAFF for help.";
   }
@@ -661,18 +1020,62 @@ function reception(
       return "Please choose a displayed slot number.";
     }
     const starts = state.slots[idx];
-    thread.state = { ...state, step: "confirm", starts };
-    const doctor = state.doctor_id ? db.doctors.find((d) => d.id === state.doctor_id) : null;
-    const service = state.service_id ? db.services.find((s) => s.id === state.service_id) : null;
+    const doctor = state.doctor_id ? db.doctors.find((d) => d.id === state.doctor_id) : defaultDoctor(clinic);
+    const service = state.service_id ? db.services.find((s) => s.id === state.service_id) : defaultService(clinic);
     const doctorName = doctor ? doctor.name : clinic.doctor;
     const serviceName = service ? service.name : "Consultation";
     const serviceFee = service ? service.fee : clinic.fee;
-    return `Confirm for ${thread.name}: ${readable(clinic, starts)} with ${doctorName}, ${serviceName}. Fee: Rs ${serviceFee}. Reply YES to confirm or NO. Your name/contact are used for booking coordination. Appointment reminders will be sent on WhatsApp; reply STOP to stop messages. No medical records are requested.`;
+
+    const walkinCheck =
+      doctor && service
+        ? isInWalkinWindow(clinic, doctor, starts, service.duration)
+        : { matched: false };
+
+    if (!walkinCheck.matched) {
+      try {
+        createSlotHold(clinic, thread, starts, doctor?.id ?? null, service?.id ?? null);
+      } catch {
+        thread.state = {
+          doctor_id: doctor?.id ?? null,
+          service_id: service?.id ?? null,
+        };
+        const fresh = offer(clinic, thread, localParts(clinic.timezone, starts).dateStr, state.appointment_id ?? null);
+        return `That slot was just taken.\n${fresh}`;
+      }
+    }
+
+    thread.state = {
+      ...state,
+      step: "confirm",
+      starts,
+      walkin_request: walkinCheck.matched,
+      walkin_window: walkinCheck.window || null,
+      expires: nowSec() + SLOT_HOLD_SECONDS,
+    };
+
+    if (walkinCheck.matched) {
+      return `Request ${readable(clinic, starts)} with ${doctorName}, ${serviceName} (Fee: Rs ${serviceFee})? This falls in our walk-in priority window (${walkinCheck.window?.start}–${walkinCheck.window?.end}), so reception will confirm availability. Reply YES to send the request or NO.`;
+    }
+    return `Holding ${readable(clinic, starts)} for 5 minutes while you confirm (${thread.name} · ${doctorName}, ${serviceName}, Fee: Rs ${serviceFee}). Reply YES to confirm or NO. Your name/contact are used for booking coordination. Appointment reminders will be sent on WhatsApp; reply STOP to stop messages. No medical records are requested.`;
   }
 
   if (state.step === "confirm" && yes) {
     const starts = state.starts;
     const oldId = state.appointment_id;
+
+    if (state.walkin_request) {
+      const doctor = state.doctor_id ? db.doctors.find((d) => d.id === state.doctor_id) : defaultDoctor(clinic);
+      const service = state.service_id ? db.services.find((s) => s.id === state.service_id) : defaultService(clinic);
+      const label = readable(clinic, starts);
+      takeover(
+        thread,
+        `Walk-in priority slot request: ${label} (${doctor?.name || clinic.doctor} · ${service?.name || "Consultation"})`,
+        "system",
+      );
+      db.audit("patient", "appointment.walkin_slot_requested", starts, clinic.id);
+      return `Your request for ${label} (walk-in priority window) has been sent to reception. Our desk will confirm your slot or suggest the nearest time shortly.`;
+    }
+
     let appt;
     try {
       thread.consent = true;
@@ -684,6 +1087,7 @@ function reception(
         appt.consent = true;
         const oldStarts = appt.starts;
         reschedule(clinic, appt, starts);
+        releaseThreadHolds(thread.id);
         appt.reminder_response = "rescheduled";
         appt.reminder_response_at = nowSec();
         offerWaitlistForSlot(clinic, oldStarts, appt.doctor_id, appt.service_id, appt.source === "demo");
@@ -696,6 +1100,7 @@ function reception(
         });
       }
     } catch {
+      releaseThreadHolds(thread.id);
       thread.state = {};
       return "That slot is no longer available. Reply BOOK to choose again. Nothing new was booked.";
     }
@@ -705,7 +1110,39 @@ function reception(
     return `Confirmed: appointment #${appt.id}, ${readable(clinic, appt.starts)}, ${doctor ? doctor.name : clinic.doctor} · ${service ? service.name : "Consultation"}. Address: ${clinic.address}. Reply CANCEL or RESCHEDULE if needed.`;
   }
 
+  if (state.step === "choose_token_session" && /^\d+$/.test(t)) {
+    const idx = Number(t) - 1;
+    const sessionIds: string[] = Array.isArray(state.session_ids) ? state.session_ids : [];
+    if (idx < 0 || idx >= sessionIds.length) {
+      return "Please reply with a displayed session number (e.g. 1).";
+    }
+    try {
+      const issued = issueQueueToken(clinic, {
+        date: state.date || null,
+        session_id: sessionIds[idx],
+        patient_name: thread.name,
+        contact: thread.contact,
+        source: thread.channel === "demo" ? "demo" : "whatsapp",
+        thread_id: thread.id,
+        actor: "patient",
+      });
+      thread.consent = true;
+      thread.state = {};
+      return `Confirmed: Token #${issued.token.token_number} for ${issued.session.label} (${issued.session.start}–${issued.session.end}) on ${issued.token.date}. Estimated wait: ~${issued.estimated_wait_minutes} mins. Address: ${clinic.address}.`;
+    } catch (e: any) {
+      thread.state = {};
+      return `${e?.detail || "Could not issue token for that session."} Reply TOKEN to try another session or STAFF for help.`;
+    }
+  }
+
+  if (TOKEN_CMD.test(t) && (clinic.booking_mode === "tokens" || clinic.booking_mode === "hybrid")) {
+    return offerTokenSessions(clinic, thread);
+  }
+
   if (BOOKING.test(t) || /^\d{4}-\d{2}-\d{2}$/.test(t)) {
+    if (clinic.booking_mode === "tokens" && !state.appointment_id && !/^\d{4}-\d{2}-\d{2}$/.test(t)) {
+      return offerTokenSessions(clinic, thread);
+    }
     if (upcoming && !state.appointment_id) {
       return `You already have appointment #${upcoming.id} on ${readable(clinic, upcoming.starts)}. Reply RESCHEDULE, CANCEL or STAFF.`;
     }
@@ -717,6 +1154,9 @@ function reception(
   }
   if (state.step === "choose") {
     return "Reply with a displayed slot number, send a date as YYYY-MM-DD, or reply STAFF.";
+  }
+  if (state.step === "choose_token_session") {
+    return "Reply with a displayed session number (e.g. 1) to get your queue token, or reply STAFF.";
   }
   if (/fee|cost|price|entha|ఫీజు|ధర|शुल्क|कीमत/i.test(lower)) {
     return `Consultation fee is Rs ${clinic.fee}. Treatment prices require clinic confirmation. Reply BOOK or STAFF.`;
@@ -781,6 +1221,14 @@ export function inbound(
     status: "received",
     created: now,
   });
+
+  // Authorized staff WhatsApp command shortcut (e.g., "BLOCK 11:00 Ramesh", "WALKIN 4:30", "UNBLOCK 11:00", "SLOTS")
+  const staffReply = tryStaffCommand(clinic, contact, text, eventKey);
+  if (staffReply) {
+    queueReply(clinic, thread, staffReply, `reply:${clinic.id}:${eventKey}`, "system");
+    return { thread, reply: staffReply };
+  }
+
   trackWhatsApp(clinic, thread);
   const reply = reception(clinic, thread, text, eventKey, buttonPayload, isMedia);
   if (reply) {

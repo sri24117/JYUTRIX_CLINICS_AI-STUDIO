@@ -118,6 +118,17 @@ CREATE TABLE IF NOT EXISTS appointments (
   data JSONB NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS slot_holds (
+  id INTEGER PRIMARY KEY,
+  clinic_id INTEGER NOT NULL,
+  doctor_id INTEGER NOT NULL,
+  thread_id INTEGER NOT NULL,
+  starts BIGINT NOT NULL,
+  ends BIGINT NOT NULL,
+  expires BIGINT NOT NULL,
+  data JSONB NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS waitlist_entries (
   id INTEGER PRIMARY KEY,
   clinic_id INTEGER NOT NULL,
@@ -156,10 +167,73 @@ CREATE TABLE IF NOT EXISTS audits (
   data JSONB NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS reviews (
+  id INTEGER PRIMARY KEY,
+  clinic_id INTEGER NOT NULL,
+  appointment_id INTEGER NOT NULL,
+  rating INTEGER,
+  status TEXT NOT NULL,
+  created BIGINT NOT NULL,
+  data JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS voice_calls (
+  id INTEGER PRIMARY KEY,
+  clinic_id INTEGER NOT NULL,
+  call_id TEXT NOT NULL,
+  direction TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  duration_seconds INTEGER NOT NULL,
+  billable_minutes INTEGER NOT NULL,
+  outcome TEXT NOT NULL,
+  created BIGINT NOT NULL,
+  data JSONB NOT NULL,
+  UNIQUE (clinic_id, call_id)
+);
+
+CREATE TABLE IF NOT EXISTS recall_campaigns (
+  id INTEGER PRIMARY KEY,
+  clinic_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  created BIGINT NOT NULL,
+  data JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS recall_dispatches (
+  id INTEGER PRIMARY KEY,
+  clinic_id INTEGER NOT NULL,
+  campaign_id INTEGER NOT NULL,
+  contact TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created BIGINT NOT NULL,
+  data JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS queue_tokens (
+  id INTEGER PRIMARY KEY,
+  clinic_id INTEGER NOT NULL,
+  date TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  token_number INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  created BIGINT NOT NULL,
+  data JSONB NOT NULL,
+  UNIQUE (clinic_id, date, session_id, token_number)
+);
+
 CREATE TABLE IF NOT EXISTS deliveries (
   key TEXT PRIMARY KEY,
   created BIGINT NOT NULL
 );
+`;
+
+// Database-level guard against two live confirmed appointments for the same doctor and time.
+// Created separately from SCHEMA_SQL so that pre-existing duplicate rows cannot stop the app from
+// starting: the application still checks for conflicts when booking.
+const LIVE_SLOT_INDEX_SQL = `
+CREATE UNIQUE INDEX IF NOT EXISTS uq_live_active_slot
+  ON appointments (clinic_id, doctor_id, starts)
+  WHERE status = 'confirmed' AND source <> 'demo' AND doctor_id IS NOT NULL
 `;
 
 export async function initPersistence(): Promise<void> {
@@ -179,6 +253,16 @@ export async function initPersistence(): Promise<void> {
   const client = await pool.connect();
   try {
     await client.query(SCHEMA_SQL);
+    try {
+      await client.query(LIVE_SLOT_INDEX_SQL);
+    } catch (err: any) {
+      console.warn(
+        "[Jyutrix] WARNING: could not create the live-slot unique index (uq_live_active_slot). " +
+          "Existing rows probably contain duplicate confirmed appointments for the same doctor and time. " +
+          "Starting without the database-level double-booking guard; resolve the duplicates and restart. " +
+          `Detail: ${err?.message || err}`,
+      );
+    }
 
     const [
       clinicsRes,
@@ -190,10 +274,16 @@ export async function initPersistence(): Promise<void> {
       messagesRes,
       jobsRes,
       apptsRes,
+      holdsRes,
       waitlistRes,
       enquiriesRes,
       leadsRes,
       auditsRes,
+      reviewsRes,
+      voiceCallsRes,
+      recallCampaignsRes,
+      recallDispatchesRes,
+      queueTokensRes,
       deliveriesRes,
       metaRes,
     ] = await Promise.all([
@@ -206,10 +296,16 @@ export async function initPersistence(): Promise<void> {
       client.query("SELECT data FROM messages ORDER BY id"),
       client.query("SELECT data FROM jobs ORDER BY id"),
       client.query("SELECT data FROM appointments ORDER BY id"),
+      client.query("SELECT data FROM slot_holds WHERE expires > $1 ORDER BY id", [nowSec()]),
       client.query("SELECT data FROM waitlist_entries ORDER BY id"),
       client.query("SELECT data FROM enquiries ORDER BY id"),
       client.query("SELECT data FROM sales_leads ORDER BY id"),
       client.query("SELECT data FROM audits ORDER BY id"),
+      client.query("SELECT data FROM reviews ORDER BY id"),
+      client.query("SELECT data FROM voice_calls ORDER BY id"),
+      client.query("SELECT data FROM recall_campaigns ORDER BY id"),
+      client.query("SELECT data FROM recall_dispatches ORDER BY id"),
+      client.query("SELECT data FROM queue_tokens ORDER BY id"),
       client.query("SELECT key FROM deliveries"),
       client.query("SELECT key, value FROM jyutrix_meta"),
     ]);
@@ -223,10 +319,16 @@ export async function initPersistence(): Promise<void> {
     db.messages = messagesRes.rows.map((r) => r.data);
     db.jobs = jobsRes.rows.map((r) => r.data);
     db.appointments = apptsRes.rows.map((r) => r.data);
+    db.holds = holdsRes.rows.map((r) => r.data);
     db.waitlist = waitlistRes.rows.map((r) => r.data);
     db.enquiries = enquiriesRes.rows.map((r) => r.data);
     db.leads = leadsRes.rows.map((r) => r.data);
     db.audits = auditsRes.rows.map((r) => r.data);
+    db.reviews = reviewsRes.rows.map((r) => r.data);
+    db.voice_calls = voiceCallsRes.rows.map((r) => r.data);
+    db.recall_campaigns = recallCampaignsRes.rows.map((r) => r.data);
+    db.recall_dispatches = recallDispatchesRes.rows.map((r) => r.data);
+    db.queue_tokens = queueTokensRes.rows.map((r) => r.data);
     db.deliveries = new Set(deliveriesRes.rows.map((r) => r.key));
 
     const seqRow = metaRes.rows.find((r) => r.key === "sequences");
@@ -253,7 +355,7 @@ async function flushNow(): Promise<void> {
     await client.query("BEGIN");
 
     await client.query(
-      "TRUNCATE clinics, users, login_sessions, doctors, services, threads, messages, jobs, appointments, waitlist_entries, enquiries, sales_leads, audits, deliveries",
+      "TRUNCATE clinics, users, login_sessions, doctors, services, threads, messages, jobs, appointments, slot_holds, waitlist_entries, enquiries, sales_leads, audits, reviews, voice_calls, recall_campaigns, recall_dispatches, queue_tokens, deliveries",
     );
 
     for (const c of db.clinics) {
@@ -312,6 +414,14 @@ async function flushNow(): Promise<void> {
         [a.id, a.clinic_id, a.doctor_id, a.service_id, a.contact, a.starts, a.ends, a.status, a.source, a],
       );
     }
+    for (const h of db.holds) {
+      if (h.expires > now) {
+        await client.query(
+          "INSERT INTO slot_holds (id, clinic_id, doctor_id, thread_id, starts, ends, expires, data) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+          [h.id, h.clinic_id, h.doctor_id, h.thread_id, h.starts, h.ends, h.expires, h],
+        );
+      }
+    }
     for (const w of db.waitlist) {
       await client.query(
         "INSERT INTO waitlist_entries (id, clinic_id, contact, status, created, data) VALUES ($1,$2,$3,$4,$5,$6)",
@@ -334,6 +444,47 @@ async function flushNow(): Promise<void> {
       await client.query(
         "INSERT INTO audits (id, clinic_id, actor, action, created, data) VALUES ($1,$2,$3,$4,$5,$6)",
         [a.id, a.clinic_id, a.actor, a.action, a.created, a],
+      );
+    }
+    for (const r of db.reviews) {
+      await client.query(
+        "INSERT INTO reviews (id, clinic_id, appointment_id, rating, status, created, data) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        [r.id, r.clinic_id, r.appointment_id, r.rating, r.status, r.created, r],
+      );
+    }
+    for (const vc of db.voice_calls) {
+      await client.query(
+        "INSERT INTO voice_calls (id, clinic_id, call_id, direction, provider, duration_seconds, billable_minutes, outcome, created, data) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+        [
+          vc.id,
+          vc.clinic_id,
+          vc.call_id,
+          vc.direction,
+          vc.provider,
+          vc.duration_seconds,
+          vc.billable_minutes,
+          vc.outcome,
+          vc.created,
+          vc,
+        ],
+      );
+    }
+    for (const rc of db.recall_campaigns) {
+      await client.query(
+        "INSERT INTO recall_campaigns (id, clinic_id, kind, created, data) VALUES ($1,$2,$3,$4,$5)",
+        [rc.id, rc.clinic_id, rc.kind, rc.created, rc],
+      );
+    }
+    for (const rd of db.recall_dispatches) {
+      await client.query(
+        "INSERT INTO recall_dispatches (id, clinic_id, campaign_id, contact, status, created, data) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        [rd.id, rd.clinic_id, rd.campaign_id, rd.contact, rd.status, rd.created, rd],
+      );
+    }
+    for (const qt of db.queue_tokens) {
+      await client.query(
+        "INSERT INTO queue_tokens (id, clinic_id, date, session_id, token_number, status, created, data) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+        [qt.id, qt.clinic_id, qt.date, qt.session_id, qt.token_number, qt.status, qt.created, qt],
       );
     }
     for (const k of db.deliveries) {

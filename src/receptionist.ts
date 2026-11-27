@@ -73,6 +73,10 @@ export function getThread(
   return row;
 }
 
+// The one message a patient still receives after sending STOP. The worker normally cancels every
+// message to an opted-out patient, so this text is marked to be allowed through.
+export const OPT_OUT_ACK = "Appointment messages are stopped. Reply START to resume, or call the clinic for help.";
+
 export function queueReply(
   clinic: Clinic,
   thread: Thread,
@@ -104,7 +108,7 @@ export function queueReply(
       due: nowSec(),
       error: "",
       message_id: msg.id,
-      payload: { text, actor, generation: thread.generation },
+      payload: { text, actor, generation: thread.generation, allow_opted_out: text === OPT_OUT_ACK },
       created: nowSec(),
     });
   }
@@ -826,7 +830,7 @@ function reception(
     }
     db.audit("patient", "consent.withdrawn", thread.id, clinic.id);
     onOptOut(clinic, thread);
-    return "Appointment messages are stopped. Reply START to resume, or call the clinic for help.";
+    return OPT_OUT_ACK;
   }
 
   if (lower === "start") {

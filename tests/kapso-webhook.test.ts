@@ -374,6 +374,19 @@ describe("signed webhook route (end to end)", () => {
     assert.equal(res.status, 422);
   });
 
+  test("confirms a STOP once and then stays silent", async () => {
+    const other = "919999900009";
+    const now = String(Math.floor(Date.now() / 1000));
+    const toOther = () => kapsoRequests.filter((r) => r.body.to === other);
+    const stop = await webhook(kapsoInbound("wamid.STOP1", "STOP", { from: other, timestamp: now }), { event: "whatsapp.message.received" });
+    assert.equal(stop.status, 200);
+    const ack = await waitFor(() => toOther()[0], "the STOP confirmation to be sent");
+    assert.match(ack.body.text.body, /stopped/i);
+    await webhook(kapsoInbound("wamid.STOP2", "Hello again", { from: other, timestamp: now }), { event: "whatsapp.message.received" });
+    await new Promise((r) => setTimeout(r, 1500));
+    assert.equal(toOther().length, 1, "an opted-out patient gets no further bot messages");
+  });
+
   test("still accepts Meta-format webhooks", async () => {
     const res = await webhook(metaInbound("wamid.META1", "Hello from Meta format"));
     assert.deepEqual(res, { status: 200, body: { ok: true, accepted: 1 } });

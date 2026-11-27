@@ -88,7 +88,7 @@ async function processJob(job: Job): Promise<void> {
     job.error = "WhatsApp thread not found";
     return;
   }
-  if (thread.opted_out) {
+  if (thread.opted_out && !job.payload?.allow_opted_out) {
     job.status = "cancelled";
     job.error = "Patient opted out";
     if (job.message_id) {
